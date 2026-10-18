@@ -67,6 +67,43 @@ TOOLS = [
 ]
 
 
+def draft_ops(hotel, raw_ops: list, why: str | None, actor: str, ref_id: int | None) -> tuple[list[int], str]:
+    """Model-drafted lobby edits -> review queue. Each op is schema-checked, deduplicated
+    against pending drafts and dry-run against the real validator, so whatever lands in
+    review is applicable. Returns (review ids, message for the model)."""
+    why = str(why or "").strip() or f"{actor} suggestion"
+    text = hotel.text()
+    ts = utcnow()
+    ids, errs = [], []
+    queued = {json.dumps(r.payload.get("op"), sort_keys=True): r.id for r in hotel.reg.pending_reviews()}
+    for i, raw in enumerate(raw_ops, 1):
+        try:
+            op = EDIT_OP.validate_python(raw)
+        except Exception as ex:
+            errs.append(f"op {i}: schema: {str(ex)[:240]}")
+            continue
+        key = json.dumps(op_dump(op), sort_keys=True)
+        if key in queued:  # models re-propose; one draft per op
+            errs.append(f"op {i}: already queued as R:{queued[key]} — don't propose it again")
+            continue
+        try:  # dry run against the real validator so the draft is applicable
+            res = apply_op(text, op, origin="approved", ts=ts, rag_id=0 if op.op == "promote" else None)
+            v = validate_transition(text, res.text, hotel.oracle)
+            if v:
+                raise OpError("; ".join(v[:2]))
+        except Exception as ex:
+            errs.append(f"op {i} ({raw.get('op')}): {str(ex)[:240]}")
+            continue
+        r = hotel.gateway.log("review", actor, ref_id=ref_id,
+                              payload={"op": op_dump(op), "reason": f"{actor} draft: {why}"})
+        queued[key] = r.id
+        ids.append(r.id)
+    out = f"queued for the user's approval: {', '.join(f'R:{i}' for i in ids)}" if ids else "nothing queued"
+    if errs:
+        out += "\nrejected (fix and propose again if still worth it):\n- " + "\n- ".join(errs)
+    return ids, out
+
+
 @dataclass
 class GuestTurn:
     reply: str
@@ -102,38 +139,9 @@ class Guest:
 
     # ----------------------------------------------------------- tools
     def _propose(self, args: dict, turn: GuestTurn) -> str:
-        why = str(args.get("why") or "").strip() or "guest suggestion"
-        text = self.h.text()
-        ts = utcnow()
-        ids, errs = [], []
-        queued = {json.dumps(r.payload.get("op"), sort_keys=True): r.id for r in self.h.reg.pending_reviews()}
-        for i, raw in enumerate(args.get("ops") or [], 1):
-            try:
-                op = EDIT_OP.validate_python(raw)
-            except Exception as ex:
-                errs.append(f"op {i}: schema: {str(ex)[:240]}")
-                continue
-            key = json.dumps(op_dump(op), sort_keys=True)
-            if key in queued:  # models re-propose; one draft per op
-                errs.append(f"op {i}: already queued as R:{queued[key]} — don't propose it again")
-                continue
-            try:  # dry run against the real validator so the draft is applicable
-                res = apply_op(text, op, origin="approved", ts=ts, rag_id=0 if op.op == "promote" else None)
-                v = validate_transition(text, res.text, self.h.oracle)
-                if v:
-                    raise OpError("; ".join(v[:2]))
-            except Exception as ex:
-                errs.append(f"op {i} ({raw.get('op')}): {str(ex)[:240]}")
-                continue
-            r = self.h.gateway.log("review", "guest", ref_id=self.thread,
-                                   payload={"op": op_dump(op), "reason": f"guest draft: {why}"})
-            queued[key] = r.id
-            ids.append(r.id)
+        ids, msg = draft_ops(self.h, args.get("ops") or [], args.get("why"), "guest", self.thread)
         turn.proposals += ids
-        out = f"queued for the user's approval: {', '.join(f'R:{i}' for i in ids)}" if ids else "nothing queued"
-        if errs:
-            out += "\nrejected (fix and propose again if still worth it):\n- " + "\n- ".join(errs)
-        return out
+        return msg
 
     def _tool(self, name: str, args: dict, turn: GuestTurn) -> str:
         gw = self.h.gateway

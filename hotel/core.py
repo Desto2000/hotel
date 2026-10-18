@@ -95,7 +95,8 @@ class RouteResult:
 
 
 class Hotel:
-    def __init__(self, paths: Paths, session_id: str | None = None, new_session: bool = False):
+    def __init__(self, paths: Paths, session_id: str | None = None, new_session: bool = False,
+                 label: str = "tui"):
         self.paths = paths
         self.cfg = load_config(paths)
         self.blobs = BlobStore(paths.blobs)
@@ -108,8 +109,9 @@ class Hotel:
             session_id = cur_file.read_text().strip() or None
         if session_id is None or self.reg.session(session_id) is None:
             snap = self.blobs.put_text(self.text())
-            session_id = self.reg.start_session("tui", snap)
-            cur_file.write_text(session_id)
+            session_id = self.reg.start_session(label, snap)
+            if label == "tui":  # other front ends (mcp) leave the TUI's current session alone
+                cur_file.write_text(session_id)
         self.session_id = session_id
         self.gateway = Gateway(self.reg, self.blobs, session_id, self.lobby_ids)
         exa = ExaClient(max_chars=self.cfg["exa_max_chars"])

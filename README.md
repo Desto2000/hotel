@@ -54,6 +54,7 @@ profile), optionally `PARALLEL_API_KEY`, or `GROQ_API_KEY` for the `groq` profil
 | Directory layer (regenerated, open entries only) | done | `derived.py` |
 | sqlite-vec embeddings, talk/solve agents, concierge, custodian dedup, hotel renderer | **not built** | — |
 | Guest agent (drafts → review → origin=approved), custodian staleness, move op, forget, backup/restore, verifier, usage logging, system install | done (v0.2) | `guest.py`, `core.py`, `backup.py`, `verify.py`, `scripts/` |
+| MCP server: the lobby as tools for Claude / Amp / Cursor (guest rights: gated retrieval, drafts → review); stdio + streamable HTTP with bearer token | done | `mcp_server.py` |
 
 ## Lobby grammar
 
@@ -89,6 +90,57 @@ the Guest tab. It can read the lobby, search the web (gated, same rules as every
 the validator, deduplicated, and parked in Review; `/approve R:n` writes it with origin=approved.
 The guest's reply itself never enters the lobby. Start a line with `>` to talk without writing it
 down ("> yes, draft it"). Messages queue: a second one waits for the first turn to finish.
+
+## MCP: the lobby inside other AI clients
+
+`hotel mcp` serves the lobby over the Model Context Protocol, so Claude (Desktop, Code), Amp,
+Cursor or any MCP client can read and research in it. The client is a model, so it gets the
+guest's rights, enforced by the server:
+
+- tools: `lobby_directory`, `lobby_search`, `read_entries`, `web_search`, `fetch`, `annotate`,
+  `propose`, `review_queue`; resources `hotel://lobby` and `hotel://directory`
+- every call is a Reg row in its own `mcp` session; after `web_search`/`fetch` every other tool
+  is refused until the client annotates (the gate is global, so the TUI waits for it too)
+- the client never writes the lobby: `propose` dry-runs ops against the validator and parks
+  them in Review, where you `/approve R:n` (origin=approved)
+
+Local clients launch it over stdio:
+
+```
+claude mcp add hotel -- hotel mcp                         # Claude Code
+"amp.mcpServers": {"hotel": {"command": "hotel", "args": ["mcp"]}}   # Amp settings.json
+{"mcpServers": {"hotel": {"command": "hotel", "args": ["mcp"]}}}     # Claude Desktop / Cursor
+```
+
+Remote clients use streamable HTTP at `/mcp` (`GET /healthz` is the unauthenticated health check):
+
+```
+HOTEL_MCP_TOKEN=$(openssl rand -hex 32) hotel mcp --http --host 0.0.0.0 --port 8765
+claude mcp add --transport http hotel https://<host>/mcp --header "Authorization: Bearer $HOTEL_MCP_TOKEN"
+"amp.mcpServers": {"hotel": {"url": "https://<host>/mcp", "headers": {"Authorization": "Bearer …"}}}
+```
+
+Without a token it binds to loopback only (with the SDK's DNS-rebinding checks); off loopback
+it refuses to start without one.
+
+### Hosting
+
+The lobby is a directory (git repo + SQLite + blobs) behind a cross-process lock, so host
+`hotel mcp --http` on the one machine that holds that directory. It needs a persistent disk and
+`git`; serverless platforms (Lambda, Vercel, Workers) don't fit.
+
+- **Your own machine + a tunnel** (recommended: the lobby stays where the TUI is).
+  Tailscale: `tailscale serve --bg 8765` gives HTTPS inside your tailnet only, or
+  `tailscale funnel --bg 8765` for a public URL. Cloudflare: `cloudflared tunnel --url
+  http://localhost:8765` (quick) or a named tunnel with Cloudflare Access in front. Run it
+  bound to `127.0.0.1` with a token; the tunnel supplies TLS.
+- **A small always-on box** (VPS, Fly.io/Railway with a volume, a home server): run
+  `scripts/install.sh /data/lobby`, then `hotel mcp --http --host 0.0.0.0` under systemd
+  behind Caddy/nginx for TLS. The lobby then lives there: use the TUI over `ssh`, and point
+  `hotel backup` at a second disk.
+
+Whatever the client is, its model sees the lobby text it reads, and its provider's data
+policy applies to that.
 
 ## Data safety
 
@@ -172,4 +224,4 @@ unchanged. UI roles map to Zed keys, and lobby syntax maps to Zed syntax scopes.
 
 ## CLI
 
-`hotel add|search|annotate <json>|lib <rid>|research <L>|guest "<msg>" [--note]|accept <rid>|move <L> <room>|custodian|backup [dir]|restore <src> <dst>|forget <rid> --reason|home [dir]|doctor|version|timings|render|snapshot|review list|approve|reject|check|verify|rebuild|reg|replay <session>|rag-import|sessions|schema`
+`hotel add|search|annotate <json>|lib <rid>|research <L>|guest "<msg>" [--note]|accept <rid>|move <L> <room>|custodian|backup [dir]|restore <src> <dst>|forget <rid> --reason|home [dir]|doctor|version|timings|render|snapshot|review list|approve|reject|check|verify|rebuild|reg|replay <session>|rag-import|sessions|schema|mcp [--http --host --port --token]`

@@ -116,6 +116,10 @@ def main(argv=None):
     s.add_argument("message"); s.add_argument("--llm"); s.add_argument("--note", action="store_true",
                                                                        help="also append your message as a monologue")
     s.add_argument("--room")
+    s = sub.add_parser("mcp", help="serve the lobby to MCP clients (stdio; --http for remote clients)")
+    s.add_argument("--http", action="store_true", help="streamable HTTP at http://HOST:PORT/mcp instead of stdio")
+    s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--token", help="bearer token for --http (default: $HOTEL_MCP_TOKEN); required off loopback")
 
     a = p.parse_args(argv)
     if a.cmd == "version":
@@ -150,6 +154,10 @@ def main(argv=None):
     if a.cmd == "schema":
         from .models import LibrarianOutput
         print(json.dumps(LibrarianOutput.model_json_schema(), indent=2))
+        return
+    if a.cmd == "mcp":
+        from .mcp_server import serve
+        serve(_hotel(a, new_session=True, label="mcp"), a.http, a.host, a.port, a.token)
         return
     if a.cmd in (None, "tui"):
         from .tui import HotelApp

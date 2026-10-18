@@ -7,7 +7,7 @@ session start:
   * hand edits                     -> cannot be replayed op-wise; reported
   * librarian lobby_edit / review  -> dropped; replaced by the new librarian
   * annotation rows                -> run the new librarian on it
-No network for recorded data: retrievals are read from blobs. A Mercury
+No network for recorded data: retrievals are read from blobs. A model
 librarian still makes fresh model calls, logged to .hotel/replay.sqlite.
 """
 
@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from .gateway import Gateway
 from .grammar import parse
-from .librarian import Librarian, RuleLibrarian, MercuryLibrarian, build_context
+from .librarian import Librarian, ModelLibrarian, RuleLibrarian, build_context
 from .models import AppendOp, CloseOp, ContestOp, PromoteOp, ReopenOp, SupersedeOp, op_load
 from .ops import OpError, apply_op, remap_op
 from .reg import Reg
@@ -75,11 +75,11 @@ def replay(hotel, session_id: str, librarian: Librarian | str = "rule",
 
     shadow = _ShadowHotel(hotel, text)
     if isinstance(librarian, str):
-        if librarian.startswith("mercury"):
+        if librarian != "rule":
             rreg = Reg(hotel.paths.replay_db)
             sid = rreg.start_session(f"replay of {session_id}")
             gw = Gateway(rreg, hotel.blobs, sid, lambda: set(shadow.lobby().entries))
-            librarian = MercuryLibrarian(hotel, gateway=gw)
+            librarian = ModelLibrarian(hotel, None if librarian == "model" else librarian, gateway=gw)
         else:
             librarian = RuleLibrarian()
     rep = ReplayReport(librarian.name, text, actual)

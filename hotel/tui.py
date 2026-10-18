@@ -40,6 +40,7 @@ HELP = """[b]write[/b]   plain text → monologue in current room · /bounty /go
 [b]gate[/b]    /annotate [R:n] (ctrl+a) — required after every external retrieval
 [b]edit[/b]    /close L R:n · /supersede L <text> · /contest L <why> · /reopen L <why>
         /tag L t · /link L L · /ref L R:n · /promote L
+[b]agent[/b]   /research L#### (one bounty per run) · /accept R:n keep an answer as an approved entry
 [b]resident[/b] /lib [R:n] run librarian · /approve R:n · /reject R:n
 [b]inspect[/b] /blob R:n · /check · /verify · /theme (ctrl+t) · /q"""
 
@@ -204,7 +205,6 @@ class HotelApp(App):
         self.pal_name = hotel.cfg.get("theme", "calculus-dark")
         self.room = hotel.cfg.get("default_room", "inbox")
         self.focus_id: str | None = None
-        self.last_hits = []
         self.positions: dict[str, int] = {}
         for p in self.pals.values():  # must exist before the stylesheet is parsed
             self.register_theme(textual_theme(p))
@@ -455,9 +455,6 @@ class HotelApp(App):
         self.librarian_on(None)
 
     # ------------------------------------------------------------- commands
-    def _ensure_room(self, room: str):
-        self.room = room
-
     def dispatch(self, line: str):
         h = self.hotel
         if not line.startswith("/"):
@@ -531,6 +528,17 @@ class HotelApp(App):
                 raise ValueError("/promote L####")
             h.apply([PromoteOp(op="promote", id=e.id, text=e.text)])
             return self.say(f"promoted {e.id} into RAG (logged, backlinked)", "created")
+        if cmd == "research":
+            if not args or args[0] not in h.lobby().entries:
+                raise ValueError("/research L####  (an existing entry, usually a bounty)")
+            if h.gateway.pending():
+                raise GateBlocked(h.gateway.pending())
+            self.say(f"… research agent on {args[0]} ({h.cfg.get('llm', 'mercury')})")
+            return self.run_research(args[0])
+        if cmd == "accept":
+            res = h.accept_output(int(args[0].removeprefix("R:")))
+            self.focus_id = res.created[0]
+            return self.say(f"+ {res.created[0]} reasoning (origin=approved) from {args[0]}", "created")
         if cmd == "lib":
             return self.librarian_on(int(args[0].removeprefix("R:")) if args else None)
         if cmd in ("approve", "reject"):
@@ -568,6 +576,42 @@ class HotelApp(App):
                      f"gate locked — ctrl+a to annotate.", "warning")
             self.refresh_all()
         self.call_from_thread(ui)
+
+    @work(thread=True, exclusive=True, group="agent")
+    def run_research(self, entry_id: str):
+        from .agent import ResearchAgent
+        h = self.hotel
+        agent = ResearchAgent(h, max_searches=h.cfg.get("agent_max_searches", 4),
+                              budget_chars=h.cfg.get("agent_budget_chars", 40000),
+                              on_event=lambda s: self.call_from_thread(self.say, f"agent · {s}"))
+        try:
+            run = agent.run(entry_id)
+            for rid in run.retrievals:
+                if h.reg.annotation_for(rid):
+                    run_librarian(h, rid)
+        except Exception as ex:
+            self.call_from_thread(self.say, f"research failed (logged): {ex}", "error")
+            self.call_from_thread(self.refresh_all)
+            return
+        st = self.st
+        t = Text()
+        if run.output_id:
+            t.append(f"R:{run.output_id} ", st["number"])
+            t.append(run.answer + chr(10), st["body"])
+            t.append(f"{run.timings()} · /accept R:{run.output_id} to keep it", st["muted"])
+        else:
+            t.append("no answer: " + "; ".join(run.log[-2:]), st["error"])
+
+        def ui():
+            self.say(t)
+            if run.output_id:
+                self.show_blob_text(f"R:{run.output_id} research answer for {entry_id}", run.answer)
+            self.refresh_all()
+        self.call_from_thread(ui)
+
+    def show_blob_text(self, title: str, text: str):
+        self.query_one("#blob", Static).update(Text(title + chr(10) * 2, self.st["room_name"]) + Text(text, self.st["body"]))
+        self.query_one(TabbedContent).active = "t-blob"
 
     @work(thread=True, exclusive=True, group="lib")
     def librarian_on(self, rid: int | None):

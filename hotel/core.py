@@ -18,12 +18,12 @@ from .derived import Derived
 from .gateway import Gateway, ToolSpec
 from .grammar import empty_lobby, parse
 from .models import (
-    AppendOp, CloseOp, ContestOp, PromoteOp, ReopenOp, SupersedeOp, op_dump, op_load,
+    AppendOp, CloseOp, ContestOp, LinkOp, PromoteOp, ReopenOp, SupersedeOp, op_dump, op_load,
 )
 from .ops import OpError, apply_op
 from .rag import Rag
 from .reg import Reg, utcnow
-from .search import ExaClient, make_tools
+from .search import ExaClient, ParallelClient, make_tools
 from .validator import validate_transition, validate_text
 
 
@@ -112,8 +112,12 @@ class Hotel:
         self.session_id = session_id
         self.gateway = Gateway(self.reg, self.blobs, session_id, self.lobby_ids)
         exa = ExaClient(max_chars=self.cfg["exa_max_chars"])
-        fns = make_tools(exa, self.rag, self.derived, self.cfg["exa_num_results"])
+        fns = make_tools(exa, self.rag, self.derived, self.cfg["exa_num_results"],
+                         parallel=ParallelClient(), backend=self.cfg.get("search_backend", "exa"),
+                         agent_num_results=self.cfg.get("agent_num_results", 3),
+                         agent_highlight_chars=self.cfg.get("agent_highlight_chars", 700))
         self.gateway.register(ToolSpec("search", "retrieval", "unified", fns["search"]))
+        self.gateway.register(ToolSpec("agent.search", "retrieval", "web+rag", fns["agent.search"]))
         self.gateway.register(ToolSpec("exa.search", "retrieval", "exa", fns["exa.search"]))
         self.gateway.register(ToolSpec("exa.fetch", "retrieval", "exa", fns["exa.fetch"]))
         self.gateway.register(ToolSpec("lobby.search", "internal", "lobby", fns["lobby.search"]))
@@ -225,6 +229,10 @@ class Hotel:
         ann = self.reg.annotation_for(rid)
         if not ann:
             return False, f"{op.closed_by} is not annotated"
+        if ann.actor != "user":
+            # A model's claim that a source answers the question is a judgment, not a
+            # mechanical fact; closing on it is meaning-changing -> review.
+            return False, f"annotation of {op.closed_by} was written by {ann.actor}, not the user"
         for c in ann.payload["claims"]:
             if c["relation"] == "supports" and op.id in c["lobby_refs"]:
                 return True, f"annotation of {op.closed_by} has a supporting claim on {op.id}"
@@ -270,3 +278,25 @@ class Hotel:
             return RouteResult(op, "rejected", f"approved but failed to apply: {ex}")
         self.gateway.log("decision", actor, ref_id=review_id, payload={"verdict": "approve", "lobby_edit": res.reg_id})
         return RouteResult(op, "applied", "approved", f"commit {res.commit[:8] if res.commit else '-'}")
+
+    # ------------------------------------------------------------- agent outputs
+    def accept_output(self, output_id: int, room: str | None = None) -> ApplyResult:
+        """User keeps a chat agent's answer: it becomes a user-approved model draft
+        (origin=approved) citing the output row and every retrieval the run made."""
+        out = self.reg.get(output_id)
+        if not out or out.kind != "output":
+            raise ValueError(f"R:{output_id} is not an output")
+        run = next((r for r in self.reg.list(kind="internal", limit=2000)
+                    if r.tool == "agent.finish" and r.payload.get("output") == output_id), None)
+        bounty = run.payload["bounty"] if run else None
+        lob = self.lobby()
+        room = room or (lob.entries[bounty].room if bounty in lob.entries else self.cfg.get("default_room", "inbox"))
+        refs = [f"R:{output_id}"] + [f"R:{r}" for r in (run.payload["retrievals"] if run else [])]
+        op = AppendOp(op="append", room=room, type="reasoning", body=self.blobs.text(out.text_hash),
+                      refs=refs, tags=["research"])
+        ops = [op]
+        res = self.apply(ops, actor="user", origin="approved", cause=output_id)
+        if bounty in lob.entries:
+            self.apply([LinkOp(op="link", id=bounty, target=res.created[0])], actor="user", origin="user",
+                       cause=output_id)
+        return res

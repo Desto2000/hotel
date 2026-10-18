@@ -60,9 +60,15 @@ class Paths:
 
 
 DEFAULT_CONFIG = {
-    "librarian": "rule",  # "rule" | "mercury"
-    "mercury_model": "mercury-2.5",
-    "mercury_base_url": "https://api.inceptionlabs.ai/v1",
+    "librarian": "rule",  # "rule" | "model" (default llm profile) | a profile name
+    "llm": "mercury",  # default router profile for agent + model librarian (see llm.py)
+    "llm_profiles": {},  # overrides / extra OpenAI-compatible endpoints
+    "librarian_output_mode": "json_schema",  # or "json_object"
+    "search_backend": "exa",  # "exa" | "parallel" for agent fan-out
+    "agent_max_searches": 4,
+    "agent_num_results": 3,  # per query; agent retrievals stay small (context is a budget)
+    "agent_highlight_chars": 700,
+    "agent_budget_chars": 40000,  # transcript size before annotated retrievals are compacted
     # Must be set true only AFTER you have disabled the training opt-in in the
     # Inception dashboard. The code cannot do that for you; it only refuses to
     # send lobby content until you assert it.

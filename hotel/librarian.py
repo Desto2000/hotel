@@ -2,9 +2,8 @@
 
 Swappable behind `Librarian.propose(ctx) -> LibrarianOutput`:
   RuleLibrarian     deterministic baseline, no network (also the replay control)
-  MercuryLibrarian  Inception Mercury 2.5 via OpenAI-compatible API with
-                    json_schema structured output; call is logged through the
-                    gateway as a `model` row (prompt + response stored by hash).
+  ModelLibrarian    any router profile (Mercury 2.5 default) with schema-constrained
+                    JSON; logged through the gateway as a `model` row.
 
 Ops never apply directly: they go through Hotel.route_resident_op (policy:
 rate cap, log-only appends, deterministic close check, review queue).
@@ -13,26 +12,29 @@ rate cap, log-only appends, deterministic close check, review queue).
 from __future__ import annotations
 
 import json
-import os
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
-import httpx
-
-from .gateway import ToolResult, ToolSpec
 from .grammar import Lobby
+from .llm import LLM
 from .models import (
     AppendOp, Annotation, CloseOp, ContestOp, LibrarianOutput, RefOp,
 )
 
-GRAMMAR_BRIEF = """Lobby rules: entries have ids like L0007, a room, a type
-(monologue|bounty|goal|reasoning|idea|log) and a status ([ ] open, [x] closed,
-[~] superseded, [!] contested, [.] static). You are a RESIDENT librarian:
-- you may append entries of type "log" only (never goals, beliefs, ideas)
-- you may tag, link (id->id) and ref (id -> R:<n> | L#### | RAG:<n>)
-- close a bounty only with closed_by "R:<n>" of an annotated retrieval that supports it
-- supersede/contest/reopen/promote are allowed but go to human review
-- body text: plain, short, no markdown. Prefer few ops; zero ops is fine."""
+GRAMMAR_BRIEF = """You are the librarian of a personal notes file (the lobby). Propose the smallest set of edit operations that files one annotated web retrieval into the lobby. Return exactly one JSON object matching the schema: {"rationale": str, "ops": [...]}. Zero ops is a good answer when nothing needs filing.
+
+The lobby: entries have ids like L0007, a room (topic), a type (monologue | bounty | goal | reasoning | idea | log) and a status: [ ] open, [x] closed, [~] superseded, [!] contested, [.] static.
+
+You are a RESIDENT. Allowed ops:
+- {"op":"ref","id":"L0007","ref":"R:12"} — cite the retrieval on an entry it is about. Most retrievals need only this.
+- {"op":"tag","id":..,"tag":"lowercase-slug"} and {"op":"link","id":..,"target":"L0003"}
+- {"op":"append","room":..,"type":"log","body":..,"refs":[..],"tags":[..]} — type MUST be "log". Never write goals, ideas, beliefs or reasoning.
+- {"op":"close","id":"L0005","closed_by":"R:12"} — only for an open bounty that a "supports" claim in the annotation directly answers.
+- {"op":"contest","id":..,"reason":..} when a claim contradicts an open bounty/goal/idea.
+- supersede, reopen and promote exist but are rarely right for you.
+
+How your output is checked (do not try to work around it): a validator applies each op to the file and rejects anything that breaks the grammar; non-log appends are rejected; close/contest/supersede go to a human review queue unless mechanically provable; there is an hourly rate cap. Body text: plain, one or two sentences, no markdown. Use only ids that appear in the context."""
 
 
 @dataclass
@@ -112,52 +114,45 @@ class RuleLibrarian:
         return LibrarianOutput(rationale="deterministic rules over annotation relations", ops=uniq)
 
 
-class MercuryLibrarian:
-    def __init__(self, hotel, model: str | None = None, base_url: str | None = None, gateway=None):
-        self.hotel = hotel
-        self.model = model or hotel.cfg["mercury_model"]
-        self.base_url = base_url or hotel.cfg["mercury_base_url"]
-        self.name = f"mercury:{self.model}"
-        self.gateway = gateway or hotel.gateway
-        if "mercury.chat" not in self.gateway.tools:
-            self.gateway.register(ToolSpec("mercury.chat", "model", "inception", self._chat))
+class ModelLibrarian:
+    """Any OpenAI-compatible model via the router (Mercury 2.5 by default).
+    Output is schema-constrained JSON, then validated locally with Pydantic; one
+    repair turn feeds the validation error back (feedback loop, not a crash)."""
 
-    def _chat(self, messages: list[dict], schema: dict) -> ToolResult:
-        key = os.environ.get("INCEPTION_API_KEY")
-        if not key:
-            raise RuntimeError("INCEPTION_API_KEY not set")
-        if not (self.hotel.cfg.get("inception_training_opt_out_confirmed")
-                or os.environ.get("HOTEL_INCEPTION_TRAINING_OPTOUT") == "confirmed"):
-            raise RuntimeError(
-                "refusing to send lobby content: disable the API training opt-in in the Inception "
-                "dashboard, then set inception_training_opt_out_confirmed=true in .hotel/config.json"
-            )
-        body = {
-            "model": self.model, "messages": messages, "max_completion_tokens": 4096,
-            "response_format": {"type": "json_schema",
-                                "json_schema": {"name": "LibrarianOutput", "strict": True, "schema": schema}},
-        }
-        r = httpx.post(f"{self.base_url}/chat/completions", json=body, timeout=90,
-                       headers={"Authorization": f"Bearer {key}"})
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        return ToolResult(r.content, content, content, "inception")
+    def __init__(self, hotel, profile: str | None = None, gateway=None, transport=None):
+        self.llm = LLM(hotel, profile, role="librarian", gateway=gateway, transport=transport)
+        self.mode = hotel.cfg.get("librarian_output_mode", "json_schema")  # or json_object
+        self.name = f"model:{self.llm.name}"
 
     def propose(self, ctx: LibrarianContext) -> LibrarianOutput:
         user = (f"Annotated retrieval R:{ctx.reg_id}\nClaims:\n{ctx.claims_text}\n\n"
                 f"Related lobby entries:\n{ctx.entries_text}\n\nRooms: {', '.join(ctx.rooms)}\n\n"
-                "Return the minimal set of edit ops.")
+                "Return the JSON object now.")
         messages = [{"role": "system", "content": GRAMMAR_BRIEF}, {"role": "user", "content": user}]
-        _, res = self.gateway.call("mercury.chat", actor="librarian",
-                                   messages=messages, schema=LibrarianOutput.model_json_schema())
-        return LibrarianOutput.model_validate_json(res.text)
+        schema = {"name": "LibrarianOutput", "strict": False, "schema": LibrarianOutput.model_json_schema()}
+        last_err = None
+        for _ in range(2):
+            if self.mode == "json_schema":
+                _, msg = self.llm.chat(messages, json_schema=schema, max_tokens=2048, actor="librarian")
+            else:
+                _, msg = self.llm.chat(messages, max_tokens=2048, actor="librarian")
+            content = (msg.get("content") or "").strip()
+            content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.M).strip()
+            try:
+                return LibrarianOutput.model_validate_json(content)
+            except Exception as ex:
+                last_err = ex
+                messages += [{"role": "assistant", "content": content},
+                             {"role": "user", "content": f"That JSON failed validation: {str(ex)[:800]}\nReturn a corrected JSON object only."}]
+        raise ValueError(f"librarian output invalid after repair: {last_err}")
 
 
 def get_librarian(hotel, name: str | None = None) -> Librarian:
     name = name or hotel.cfg.get("librarian", "rule")
-    if name.startswith("mercury"):
-        return MercuryLibrarian(hotel)
-    return RuleLibrarian()
+    if name == "rule":
+        return RuleLibrarian()
+    # "model" -> default llm profile; "mercury" / "groq" / any profile name -> that profile
+    return ModelLibrarian(hotel, None if name == "model" else name)
 
 
 def run_librarian(hotel, reg_id: int, librarian: Librarian | None = None):

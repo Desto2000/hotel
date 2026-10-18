@@ -11,7 +11,9 @@ Every tool is wrapped. On call the gateway:
 
 from __future__ import annotations
 
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -20,7 +22,10 @@ from .grammar import ID_RE
 from .models import Annotation, Pointer
 from .reg import Reg, RegEntry
 
-GATED_KINDS = {"retrieval", "model", "output"}
+# Inference itself is NOT gated: an agent that just searched needs an inference
+# turn to write the annotation. The gate blocks the next *tool call* / output.
+GATED_KINDS = {"retrieval", "output"}
+ARGS_INLINE_MAX = 2048  # larger args (model prompts) go to a blob, not the Reg row
 
 
 class GateBlocked(Exception):
@@ -67,8 +72,8 @@ class Gateway:
     def pending(self) -> list[RegEntry]:
         return self.reg.unannotated_retrievals()
 
-    def _gate(self, what: str, actor: str, kind: str) -> None:
-        if kind not in GATED_KINDS:
+    def _gate(self, what: str, actor: str, kind: str, force: bool = False) -> None:
+        if kind not in GATED_KINDS and not force:
             return
         pend = self.pending()
         if pend:
@@ -78,30 +83,40 @@ class Gateway:
             )
             raise GateBlocked(pend)
 
+    def _args_payload(self, args: dict) -> dict:
+        enc = json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+        if len(enc) <= ARGS_INLINE_MAX:
+            return {"args": args}
+        return {"args_blob": self.blobs.put_text(enc)}
+
     # ------------------------------------------------------------- calls
-    def call(self, name: str, actor: str = "model", **args) -> tuple[RegEntry, ToolResult]:
+    def call(self, name: str, actor: str = "model", *, gate_all: bool = False, **args) -> tuple[RegEntry, ToolResult]:
+        """gate_all=True: block even ungated kinds (agents: every tool call waits for annotation)."""
         spec = self.tools[name]
-        self._gate(name, actor, spec.kind)
+        self._gate(name, actor, spec.kind, force=gate_all)
+        t0 = time.perf_counter()
         try:
             res = spec.fn(**args)
         except Exception as ex:  # failures are logged too, and need no annotation
             self.reg.append(
                 self.session_id, spec.kind, actor, tool=name, provider=spec.provider,
-                payload={"args": args}, status="error", error=f"{type(ex).__name__}: {ex}",
+                payload={**self._args_payload(args), "ms": int((time.perf_counter() - t0) * 1000)},
+                status="error", error=f"{type(ex).__name__}: {ex}"[:2000],
             )
             raise
+        ms = int((time.perf_counter() - t0) * 1000)
         rh = self.blobs.put(res.raw)
         th = self.blobs.put_text(res.text)
         entry = self.reg.append(
             self.session_id, spec.kind, actor, tool=name, provider=res.provider or spec.provider,
-            payload={"args": args}, result_hash=rh, text_hash=th,
+            payload={**self._args_payload(args), "ms": ms}, result_hash=rh, text_hash=th,
         )
         return entry, res
 
-    def output(self, text: str, actor: str = "model") -> RegEntry:
+    def output(self, text: str, actor: str = "model", ref_id: int | None = None) -> RegEntry:
         self._gate("output", actor, "output")
         th = self.blobs.put_text(text)
-        return self.reg.append(self.session_id, "output", actor, text_hash=th)
+        return self.reg.append(self.session_id, "output", actor, text_hash=th, ref_id=ref_id)
 
     def log(self, kind: str, actor: str, **kw) -> RegEntry:
         return self.reg.append(self.session_id, kind, actor, **kw)
@@ -159,8 +174,10 @@ def validate_annotation(ann: Annotation, reg: Reg, blobs: BlobStore, lobby_ids: 
 
 
 def find_quote(text: str, quote: str) -> tuple[int, int] | None:
-    """Locate quote in the stored text: exact first, then whitespace-insensitive.
-    Returns the span of the *stored* text so the pointer quote is exact."""
+    """Locate quote in the stored text: exact, then whitespace-insensitive, then
+    tolerant of markdown emphasis (models drop `**bold**` / `_x_` / `code` marks
+    when quoting). Always returns the span of the *stored* text, so the pointer's
+    quote is exact and re-verifiable."""
     quote = quote.strip()
     if not quote:
         return None
@@ -170,6 +187,13 @@ def find_quote(text: str, quote: str) -> tuple[int, int] | None:
     words = quote.split()
     pat = r"\s+".join(re.escape(w) for w in words)
     m = re.search(pat, text) or re.search(pat, text, flags=re.IGNORECASE)
+    if not m:
+        toks = [w.strip("*_`") for w in words]
+        toks = [t for t in toks if t]
+        if toks:
+            mk = r"[*_`]*"
+            pat = mk + (mk + r"\s+" + mk).join(re.escape(t) for t in toks) + mk
+            m = re.search(pat, text) or re.search(pat, text, flags=re.IGNORECASE)
     return (m.start(), m.end()) if m else None
 
 

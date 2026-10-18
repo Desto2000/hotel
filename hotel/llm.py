@@ -18,6 +18,7 @@ from typing import Callable
 
 import httpx
 
+from . import keys
 from .gateway import ToolResult, ToolSpec
 
 DEFAULT_PROFILES = {
@@ -63,9 +64,9 @@ class Profile:
     price: dict | None = None  # {"in": usd_per_mtok, "out": usd_per_mtok}; set in config to log cost
 
     def key(self) -> str:
-        k = os.environ.get(self.key_env) or (os.environ.get(self.key_env_fallback) if self.key_env_fallback else None)
+        k = keys.get(self.key_env, *([self.key_env_fallback] if self.key_env_fallback else []))
         if not k:
-            raise LLMError(f"{self.key_env} not set (profile {self.name})")
+            raise LLMError(f"{self.key_env} not set (profile {self.name}) — run `hotel setup`")
         return k
 
 

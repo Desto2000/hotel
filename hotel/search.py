@@ -13,7 +13,6 @@ queries per round, query de-duplication (Jaccard > 0.8 rejected).
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +20,7 @@ from dataclasses import asdict, dataclass
 
 import httpx
 
+from . import keys
 from .derived import Derived
 from .gateway import ToolResult
 from .rag import Rag
@@ -94,13 +94,14 @@ class ExaClient:
     BASE = "https://api.exa.ai"
 
     def __init__(self, api_key: str | None = None, max_chars: int = 4000):
-        self.api_key = api_key or os.environ.get("EXA_API_KEY") or os.environ.get("MCP_EXA_API_KEY")
+        self.api_key = api_key
         self.max_chars = max_chars
 
     def _post(self, path: str, body: dict) -> bytes:
-        if not self.api_key:
-            raise RuntimeError("EXA_API_KEY not set")
-        return _post_retry(self.BASE + path, body, {"x-api-key": self.api_key, "content-type": "application/json"})
+        key = self.api_key or keys.get("EXA_API_KEY")  # resolved per call: `hotel setup` can run while the TUI is open
+        if not key:
+            raise RuntimeError("EXA_API_KEY not set — run `hotel setup`")
+        return _post_retry(self.BASE + path, body, {"x-api-key": key, "content-type": "application/json"})
 
     @staticmethod
     def _hits(raw: bytes, query: str | None = None) -> list[Hit]:
@@ -136,15 +137,16 @@ class ParallelClient:
     URL = "https://api.parallel.ai/v1/search"
 
     def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or os.environ.get("PARALLEL_API_KEY")
+        self.api_key = api_key
 
     def search_many(self, queries: list[str], objective: str, num_results: int = 5) -> tuple[bytes, list[Hit]]:
-        if not self.api_key:
-            raise RuntimeError("PARALLEL_API_KEY not set")
+        key = self.api_key or keys.get("PARALLEL_API_KEY")
+        if not key:
+            raise RuntimeError("PARALLEL_API_KEY not set — run `hotel setup`")
         raw = _post_retry(self.URL, {
             "objective": objective, "search_queries": queries, "mode": "turbo",
             "advanced_settings": {"max_results": num_results * len(queries)},
-        }, {"x-api-key": self.api_key, "Content-Type": "application/json"})
+        }, {"x-api-key": key, "Content-Type": "application/json"})
         now = utcnow()
         hits = [Hit("parallel", it.get("url") or "", it.get("title") or "", it.get("url"),
                     "\n".join(f"- {e.strip()}" for e in (it.get("excerpts") or [])), now, "external",

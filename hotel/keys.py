@@ -1,0 +1,204 @@
+"""API keys: where they live, how they are found, and the onboarding wizard.
+
+Lookup order for any key: process environment (incl. the provider's legacy alias),
+then the per-user key file (~/.config/hotel/keys.json, mode 0600 where the OS
+supports it). Keys never go into the hotel home: that directory is backed up and
+its lobby is git-tracked.
+"""
+
+from __future__ import annotations
+
+import getpass
+import json
+import os
+import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
+
+import httpx
+
+KEYS_FILE = Path.home() / ".config" / "hotel" / "keys.json"
+
+
+@dataclass(frozen=True)
+class Provider:
+    env: str
+    name: str
+    purpose: str
+    url: str  # where to get a key
+    required: bool = False
+    aliases: tuple[str, ...] = ()
+    check: tuple[str, str, str] | None = None  # (method, url, auth header kind: "bearer" | "x-api-key")
+    check_body: dict | None = None
+
+
+PROVIDERS = [
+    Provider("EXA_API_KEY", "Exa", "web search for the research agent and /s, /exa, /fetch", "https://dashboard.exa.ai/api-keys",
+             required=True, aliases=("MCP_EXA_API_KEY",),
+             check=("POST", "https://api.exa.ai/search", "x-api-key"),
+             check_body={"query": "hotel", "numResults": 1}),
+    Provider("INCEPTION_API_KEY", "Mercury (Inception)", "default model for the agent, guest and model librarian",
+             "https://platform.inceptionlabs.ai/", required=True,
+             check=("GET", "https://api.inceptionlabs.ai/v1/models", "bearer")),
+    Provider("PARALLEL_API_KEY", "Parallel", "optional alternative search backend", "https://platform.parallel.ai/"),
+    Provider("GROQ_API_KEY", "Groq", "optional `groq` model profile", "https://console.groq.com/keys",
+             aliases=("HERMES_CUSTOM_GROQ_API_KEY",),
+             check=("GET", "https://api.groq.com/openai/v1/models", "bearer")),
+]
+BY_ENV = {p.env: p for p in PROVIDERS}
+
+
+def _read() -> dict[str, str]:
+    try:
+        d = json.loads(KEYS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as ex:
+        raise RuntimeError(f"cannot read {KEYS_FILE}: {ex}") from ex
+    return {k: v for k, v in d.items() if isinstance(v, str) and v}
+
+
+def _write(d: dict[str, str]) -> None:
+    KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = KEYS_FILE.with_name(KEYS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)  # no-op semantics on Windows, which uses the profile ACL
+    except OSError:
+        pass
+    os.replace(tmp, KEYS_FILE)
+
+
+def source(env: str) -> str | None:
+    """Where the key for `env` comes from: "env", "file" or None."""
+    names = (env, *(BY_ENV[env].aliases if env in BY_ENV else ()))
+    if any(os.environ.get(n) for n in names):
+        return "env"
+    return "file" if _read().get(env) else None
+
+
+def get(env: str, *aliases: str) -> str | None:
+    """Environment (name, then aliases), then the key file. None when unset."""
+    for n in (env, *aliases, *(BY_ENV[env].aliases if env in BY_ENV else ())):
+        if os.environ.get(n):
+            return os.environ[n]
+    return _read().get(env)
+
+
+def set_key(env: str, value: str) -> None:
+    value = value.strip()
+    if not value:
+        raise ValueError("empty key")
+    _write({**_read(), env: value})
+
+
+def remove_key(env: str) -> bool:
+    d = _read()
+    if env not in d:
+        return False
+    del d[env]
+    _write(d)
+    return True
+
+
+def mask(key: str) -> str:
+    return key[:4] + "…" + key[-2:] if len(key) > 10 else "…"
+
+
+def validate(p: Provider, key: str, *, post: Callable | None = None) -> tuple[bool | None, str]:
+    """(True|False|None, detail). None = cannot tell (no check endpoint, or network trouble);
+    only a 401/403 counts as a bad key."""
+    if p.check is None:
+        return None, "no cheap check available; key saved unverified"
+    method, url, kind = p.check
+    headers = {"Authorization": f"Bearer {key}"} if kind == "bearer" else {"x-api-key": key}
+    try:
+        r = (post or httpx.request)(method, url, headers=headers, json=p.check_body, timeout=15)
+    except httpx.HTTPError as ex:
+        return None, f"could not reach {url}: {ex.__class__.__name__}"
+    if r.status_code in (401, 403):
+        return False, f"rejected ({r.status_code})"
+    if r.is_error and r.status_code != 429:
+        return None, f"unexpected {r.status_code}; key may still be fine"
+    return True, "accepted"
+
+
+def status() -> list[dict]:
+    return [{"env": p.env, "name": p.name, "required": p.required, "purpose": p.purpose,
+             "source": source(p.env)} for p in PROVIDERS]
+
+
+def missing_required() -> list[Provider]:
+    return [p for p in PROVIDERS if p.required and source(p.env) is None]
+
+
+# ------------------------------------------------------------------ wizard
+def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[str], str] = getpass.getpass,
+            out: Callable[[str], None] = print, check: bool = True, only: list[str] | None = None,
+            post: Callable | None = None) -> bool:
+    """Walk the user through each provider. Enter keeps the current state / skips.
+    Returns True when every required key is available afterwards."""
+    out("hotel setup — API keys\n")
+    out(f"Keys are stored in {KEYS_FILE} (outside your lobby and its backups).")
+    out("Environment variables always win over stored keys. Press Enter to skip a provider.\n")
+    for p in PROVIDERS:
+        if only and p.env not in only:
+            continue
+        src = source(p.env)
+        tag = "required" if p.required else "optional"
+        out(f"{p.name} [{tag}] — {p.purpose}")
+        if src == "env":
+            out(f"  {p.env} is set in your environment; nothing to do.\n")
+            continue
+        if src == "file":
+            ans = ask(f"  stored key {mask(get(p.env) or '')} — replace it? [y/N] ").strip().lower()
+            if ans not in ("y", "yes"):
+                out("")
+                continue
+        else:
+            out(f"  get a key: {p.url}")
+        for _ in range(3):
+            key = secret(f"  paste {p.env} (hidden, Enter to skip): ").strip()
+            if not key:
+                out("  skipped\n")
+                break
+            if check:
+                good, detail = validate(p, key, post=post)
+                if good is False:
+                    out(f"  {detail} — check the key and try again")
+                    continue
+                out(f"  {detail}")
+            set_key(p.env, key)
+            out(f"  saved {mask(key)}\n")
+            break
+    if home is not None and (only is None or "INCEPTION_API_KEY" in only):
+        _optout_step(home, ask, out)
+    left = missing_required()
+    if left:
+        out("still missing (required): " + ", ".join(p.env for p in left) + " — rerun `hotel setup` any time")
+    else:
+        out("all required keys available. `hotel doctor` checks the rest; `hotel` opens the lobby.")
+    return not left
+
+
+def _optout_step(home, ask, out) -> None:
+    from .config import load_config, save_config
+    cfg = load_config(home)
+    if cfg.get("inception_training_opt_out_confirmed"):
+        return
+    out("Mercury trains on API traffic unless you opt out in the Inception dashboard.")
+    out("hotel refuses to send lobby content to it until you confirm you have done that.")
+    ans = ask("  have you turned the training opt-in OFF in the dashboard? [y/N] ").strip().lower()
+    if ans in ("y", "yes"):
+        saved = json.loads(home.config.read_text(encoding="utf-8")) if home.config.exists() else dict(cfg)
+        saved["inception_training_opt_out_confirmed"] = True
+        save_config(home, saved)
+        out("  recorded in .hotel/config.json\n")
+    else:
+        out("  not confirmed — model features stay blocked until you do (rerun `hotel setup`)\n")
+
+
+def interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()

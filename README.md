@@ -29,8 +29,25 @@ Development:
 uv sync && uv run pytest -q
 ```
 
-Env: `EXA_API_KEY` (falls back to `MCP_EXA_API_KEY`), `INCEPTION_API_KEY` (Mercury, the default model
-profile), optionally `PARALLEL_API_KEY`, or `GROQ_API_KEY` for the `groq` profile.
+### API keys
+
+Run `hotel setup` (also offered at the end of `hotel init`). It walks through each provider, tells
+you where to get a key, reads it hidden, checks it against the provider, and stores it in
+`~/.config/hotel/keys.json` (outside the lobby and its backups). A key rejected with 401/403 is
+refused and re-asked; network trouble or provider errors save the key with a note. For Mercury it
+also asks you to confirm the training opt-out (see Data safety) and records that in the home config.
+
+| key | used for |
+|---|---|
+| `EXA_API_KEY` (alias `MCP_EXA_API_KEY`) | web search (required) |
+| `INCEPTION_API_KEY` | Mercury, the default model profile (required) |
+| `PARALLEL_API_KEY` | optional search backend |
+| `GROQ_API_KEY` (alias `HERMES_CUSTOM_GROQ_API_KEY`) | optional `groq` profile |
+
+Environment variables always win over stored keys. Scripted use: `echo $KEY | hotel keys set EXA_API_KEY`,
+`hotel keys list` (never prints values), `hotel keys rm <ENV>`; `hotel setup --only EXA_API_KEY` for one key,
+`--no-check` to skip the validation request (the Exa check is one 1-result search). `hotel doctor`
+reports where each key comes from. Custom `llm_profiles` with their own `key_env` read the same store.
 
 ## What is built (spec build order)
 
@@ -224,4 +241,4 @@ unchanged. UI roles map to Zed keys, and lobby syntax maps to Zed syntax scopes.
 
 ## CLI
 
-`hotel add|search|annotate <json>|lib <rid>|research <L>|guest "<msg>" [--note]|accept <rid>|move <L> <room>|custodian|backup [dir]|restore <src> <dst>|forget <rid> --reason|home [dir]|doctor|version|timings|render|snapshot|review list|approve|reject|check|verify|rebuild|reg|replay <session>|rag-import|sessions|schema|mcp [--http --host --port --token]`
+`hotel add|search|annotate <json>|lib <rid>|research <L>|guest "<msg>" [--note]|accept <rid>|move <L> <room>|custodian|backup [dir]|restore <src> <dst>|forget <rid> --reason|home [dir]|setup|keys list\|set\|rm|doctor|version|timings|render|snapshot|review list|approve|reject|check|verify|rebuild|reg|replay <session>|rag-import|sessions|schema|mcp [--http --host --port --token]`

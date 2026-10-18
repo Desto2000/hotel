@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from pathlib import Path
 
+from . import keys
 from .config import Paths, find_root
 
 
@@ -61,12 +63,44 @@ def doctor(args) -> int:
             line(True, "latest backup", latest_snapshot(bdir).name)
         except FileNotFoundError:
             line(None, "latest backup", f"none under {bdir} — run `hotel backup`")
-    for env, what in [("EXA_API_KEY", "Exa (falls back to MCP_EXA_API_KEY)"), ("INCEPTION_API_KEY", "Mercury"),
-                      ("PARALLEL_API_KEY", "Parallel (optional)"), ("GROQ_API_KEY", "Groq profile (optional)")]:
-        have = bool(os.environ.get(env) or (env == "EXA_API_KEY" and os.environ.get("MCP_EXA_API_KEY"))
-                    or (env == "GROQ_API_KEY" and os.environ.get("HERMES_CUSTOM_GROQ_API_KEY")))
-        line(True if have else None, f"{env}", what if have else f"not set — {what} unavailable")
+    for k in keys.status():
+        what = f"{k['name']}{'' if k['required'] else ' (optional)'}"
+        line(True if k["source"] else None, k["env"],
+             f"{what}, from {k['source']}" if k["source"] else f"not set — {what} unavailable; run `hotel setup`")
     return 0 if ok else 1
+
+
+def setup(args) -> int:
+    home = None
+    root = Path(args.home).resolve() if args.home else find_root()
+    if root and (root / ".hotel").is_dir():
+        home = Paths(root)
+    if not keys.interactive():
+        sys.exit("`hotel setup` is interactive; in scripts use `hotel keys set ENV_NAME` (reads stdin) or environment variables")
+    done = keys.onboard(home=home, check=not args.no_check, only=args.only or None)
+    if home is None:
+        print("\nno hotel home yet — run `hotel init <dir>` to create one")
+    return 0 if done else 1
+
+
+def keys_cmd(args) -> int:
+    if args.action == "list":
+        for k in keys.status():
+            print(f"{k['env']:<20} {k['source'] or 'missing':<8} {'required' if k['required'] else 'optional'}  {k['name']}")
+        print(f"\nstore: {keys.KEYS_FILE}")
+        return 0
+    if not args.env:
+        sys.exit(f"hotel keys {args.action} needs an ENV_NAME, e.g. EXA_API_KEY")
+    if args.action == "rm":
+        print("removed" if keys.remove_key(args.env) else "not in the key file")
+        return 0
+    value = getpass.getpass(f"{args.env}: ") if keys.interactive() else sys.stdin.readline()
+    try:
+        keys.set_key(args.env, value)
+    except ValueError:
+        sys.exit("empty key; nothing saved")
+    print(f"saved {args.env} to {keys.KEYS_FILE}")
+    return 0
 
 
 def main(argv=None):
@@ -101,6 +135,11 @@ def main(argv=None):
     sub.add_parser("schema", help="print the librarian JSON schema")
     sub.add_parser("version")
     sub.add_parser("doctor", help="check install, home, lobby, reg chain, backups, keys")
+    s = sub.add_parser("setup", aliases=["onboard"], help="guided API key onboarding (validates and stores keys)")
+    s.add_argument("--only", action="append", metavar="ENV_NAME", help="just this key (repeatable)")
+    s.add_argument("--no-check", action="store_true", help="skip the live validation request")
+    s = sub.add_parser("keys", help="list / set / rm stored API keys (set reads the value from stdin)")
+    s.add_argument("action", choices=["list", "set", "rm"]); s.add_argument("env", nargs="?")
     s = sub.add_parser("home", help="show or set the default hotel home used from any directory")
     s.add_argument("dir", nargs="?")
     s = sub.add_parser("backup", help="incremental backup (reg, rag, blobs, lobby git bundle)")
@@ -128,6 +167,10 @@ def main(argv=None):
         return
     if a.cmd == "doctor":
         sys.exit(doctor(a))
+    if a.cmd in ("setup", "onboard"):
+        sys.exit(setup(a))
+    if a.cmd == "keys":
+        sys.exit(keys_cmd(a))
     if a.cmd == "home":
         from .config import set_default_home
         if a.dir:
@@ -150,6 +193,12 @@ def main(argv=None):
         if not USER_HOME_FILE.exists():
             set_default_home(paths.root)
             print(f"set as default home ({USER_HOME_FILE}); `hotel` now works from any directory")
+        left = keys.missing_required()
+        if left and keys.interactive():
+            if input(f"\n{', '.join(p.env for p in left)} not set. Set up API keys now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+                keys.onboard(home=paths)
+        elif left:
+            print("API keys missing: " + ", ".join(p.env for p in left) + " — run `hotel setup`")
         return
     if a.cmd == "schema":
         from .models import LibrarianOutput
@@ -162,6 +211,9 @@ def main(argv=None):
     if a.cmd in (None, "tui"):
         from .tui import HotelApp
         h = _hotel(a, new_session=getattr(a, "new_session", False))
+        left = keys.missing_required()
+        if left and keys.interactive():
+            print("missing API keys: " + ", ".join(p.env for p in left) + " — run `hotel setup` (search and model features are off until then)", file=sys.stderr)
         HotelApp(h).run()
         return
 

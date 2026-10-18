@@ -52,6 +52,8 @@ META_VALUE = {
     "superseded-by": ID_RE,
     "closed-by": re.compile(r"^(R:\d+|L\d{4,})$"),
     "promoted": re.compile(r"^RAG:\d+$"),
+    "revalidate": re.compile(r"^\d{4}-\d\d-\d\d$"),
+    "moved-from": re.compile(r"^[a-z0-9][a-z0-9_\-/.]*$"),
     "note": re.compile(r"^.+$"),
 }
 ROOM_SLUG = re.compile(r"^[a-z0-9][a-z0-9_\-/.]*$")

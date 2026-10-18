@@ -15,10 +15,11 @@ from pathlib import Path
 from .blobs import BlobStore
 from .config import Paths, load_config, save_config, DEFAULT_CONFIG
 from .derived import Derived
-from .gateway import Gateway, ToolSpec
+from .gateway import Gateway, ToolSpec, load_annotation
 from .grammar import empty_lobby, parse
+from .locking import atomic_write_text, file_lock
 from .models import (
-    AppendOp, CloseOp, ContestOp, LinkOp, PromoteOp, ReopenOp, SupersedeOp, op_dump, op_load,
+    AppendOp, CloseOp, ContestOp, LinkOp, MoveOp, PromoteOp, ReopenOp, SupersedeOp, TagOp, op_dump, op_load,
 )
 from .ops import OpError, apply_op
 from .rag import Rag
@@ -161,6 +162,10 @@ class Hotel:
 
     def sync_hand_edits(self) -> list[str]:
         """If the user edited lobby.txt by hand, validate and commit it as a user edit."""
+        with file_lock(self.paths.state / "lobby.lock"):
+            return self._sync_hand_edits_locked()
+
+    def _sync_hand_edits_locked(self) -> list[str]:
         head = self.head_text()
         cur = self.text()
         if head is None or head == cur:
@@ -180,6 +185,16 @@ class Hotel:
     # ------------------------------------------------------------- apply
     def apply(self, ops: list, *, actor: str = "user", origin: str = "user",
               cause: int | None = None) -> ApplyResult:
+        """Read -> apply -> validate -> write -> commit, under an exclusive cross-process
+        lock. Uncommitted hand edits are validated and committed first, so a write can
+        never silently absorb (or clobber) an editor's change."""
+        with file_lock(self.paths.state / "lobby.lock"):
+            errs = self._sync_hand_edits_locked()
+            if errs:
+                raise ValidationFailed(["uncommitted hand edit to lobby.txt is invalid: " + e for e in errs])
+            return self._apply_locked(ops, actor=actor, origin=origin, cause=cause)
+
+    def _apply_locked(self, ops: list, *, actor: str, origin: str, cause: int | None) -> ApplyResult:
         old = self.text()
         ts = utcnow()
         text, created, touched, op_ids = old, [], [], []
@@ -188,7 +203,8 @@ class Hotel:
             rag_id = None
             if isinstance(op, PromoteOp):
                 rag_id = self.rag.next_id() + len(promotes)
-            res = apply_op(text, op, origin=origin, ts=ts, rag_id=rag_id)
+            res = apply_op(text, op, origin=origin, ts=ts, rag_id=rag_id,
+                           revalidate_days=self.cfg.get("bounty_revalidate_days"))
             if res.noop:
                 op_ids.append([])
                 continue
@@ -203,7 +219,7 @@ class Hotel:
         errs = validate_transition(old, text, self.oracle)
         if errs:
             raise ValidationFailed(errs)
-        self.paths.lobby.write_text(text, encoding="utf-8", newline="\n")
+        atomic_write_text(self.paths.lobby, text)
         for rag_id, op in promotes:
             self.rag.add("promotion", "lobby-librarian", f"promoted {op.id}", op.text, doc_id=rag_id)
         git(self.paths.root, "add", "lobby.txt")
@@ -211,6 +227,7 @@ class Hotel:
         commit = _commit(self.paths.root, f"lobby[{actor}/{origin}]: {summary}")
         entry = self.gateway.log("lobby_edit", actor, ref_id=cause, payload={
             "ops": [op_dump(o) for o in ops], "created": op_ids, "origin": origin, "ts": ts,
+            "revalidate_days": self.cfg.get("bounty_revalidate_days"),
             "before": self.blobs.put_text(old), "after": self.blobs.put_text(text), "commit": commit,
             "promoted": [r for r, _ in promotes],
         })
@@ -226,14 +243,17 @@ class Hotel:
         if not op.closed_by.startswith("R:"):
             return False, "closed_by must be a Reg retrieval"
         rid = int(op.closed_by[2:])
-        ann = self.reg.annotation_for(rid)
-        if not ann:
+        ann_row = self.reg.annotation_for(rid)
+        if not ann_row:
             return False, f"{op.closed_by} is not annotated"
-        if ann.actor != "user":
+        if ann_row.actor != "user":
             # A model's claim that a source answers the question is a judgment, not a
             # mechanical fact; closing on it is meaning-changing -> review.
-            return False, f"annotation of {op.closed_by} was written by {ann.actor}, not the user"
-        for c in ann.payload["claims"]:
+            return False, f"annotation of {op.closed_by} was written by {ann_row.actor}, not the user"
+        ann = load_annotation(ann_row, self.blobs)
+        if ann is None:
+            return False, f"annotation of {op.closed_by} was forgotten"
+        for c in ann["claims"]:
             if c["relation"] == "supports" and op.id in c["lobby_refs"]:
                 return True, f"annotation of {op.closed_by} has a supporting claim on {op.id}"
         return False, f"no supporting claim on {op.id} in annotation of {op.closed_by}"
@@ -244,7 +264,7 @@ class Hotel:
             return RouteResult(op, "rejected", "rate cap reached")
         if isinstance(op, AppendOp) and op.type != "log":
             return RouteResult(op, "rejected", f"residents never author new {op.type} entries")
-        meaning_changing = isinstance(op, (SupersedeOp, ContestOp, ReopenOp, PromoteOp))
+        meaning_changing = isinstance(op, (SupersedeOp, ContestOp, ReopenOp, PromoteOp, MoveOp))
         if isinstance(op, CloseOp):
             ok, why = self.close_is_deterministic(op)
             meaning_changing, reason = (not ok), why
@@ -278,6 +298,47 @@ class Hotel:
             return RouteResult(op, "rejected", f"approved but failed to apply: {ex}")
         self.gateway.log("decision", actor, ref_id=review_id, payload={"verdict": "approve", "lobby_edit": res.reg_id})
         return RouteResult(op, "applied", "approved", f"commit {res.commit[:8] if res.commit else '-'}")
+
+    # ------------------------------------------------------------- custodian
+    def custodian(self, today: str | None = None) -> list[RouteResult]:
+        """Resident housekeeping (deterministic, no model): closed bounties past their
+        `revalidate` date get tagged `stale` plus a log entry. It never reopens or
+        re-answers anything — that is a meaning change and stays with the user."""
+        today = today or utcnow()[:10]
+        out = []
+        for e in self.lobby().entries.values():
+            due = e.metas("revalidate")
+            if e.sigil == "x" and due and max(due) <= today and "stale" not in e.metas("tag"):
+                out.append(self.route_resident_op(TagOp(op="tag", id=e.id, tag="stale"), "custodian", None))
+                out.append(self.route_resident_op(AppendOp(
+                    op="append", room=e.room, type="log", refs=[e.id], tags=["stale"],
+                    body=f"{e.id}: evidence due for revalidation since {max(due)}. "
+                         f"Re-run /research {e.id}; supersede the answer if it changed."), "custodian", None))
+        return out
+
+    # ------------------------------------------------------------- forgetting
+    def forget(self, rid: int, reason: str, actor: str = "user") -> dict:
+        """Delete the content behind a Reg row (result, text, args, and for a
+        retrieval its annotation's quotes). Rows stay — immutability and the hash
+        chain hold — but the bytes are gone. Lobby text is NOT covered: it lives
+        in git history and needs a history rewrite (git filter-repo)."""
+        row = self.reg.get(rid)
+        if row is None:
+            raise ValueError(f"no R:{rid}")
+        if not reason.strip():
+            raise ValueError("a reason is required (it is logged; the content is not)")
+        hashes = [h for h in (row.result_hash, row.text_hash) if h]
+        p = row.payload or {}
+        hashes += [p[k] for k in ("args_blob", "annotation_blob") if isinstance(p.get(k), str)]
+        if row.kind == "retrieval":
+            for a in self.reg.list(kind="annotation", limit=100000):
+                if a.ref_id == rid and a.payload and a.payload.get("annotation_blob"):
+                    hashes.append(a.payload["annotation_blob"])
+        hashes = sorted(set(hashes))
+        deleted = [h for h in hashes if self.blobs.delete(h)]
+        self.gateway.log("redaction", actor, ref_id=rid, payload={"blobs": hashes, "deleted": len(deleted),
+                                                                  "reason": reason})
+        return {"target": rid, "blobs": hashes, "deleted": len(deleted)}
 
     # ------------------------------------------------------------- agent outputs
     def accept_output(self, output_id: int, room: str | None = None) -> ApplyResult:

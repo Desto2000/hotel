@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .grammar import Lobby
+from .gateway import load_annotation
 from .llm import LLM
 from .models import (
     AppendOp, Annotation, CloseOp, ContestOp, LibrarianOutput, RefOp,
@@ -57,7 +58,10 @@ def build_context(hotel, reg_id: int, lobby: Lobby | None = None) -> LibrarianCo
     ann_row = hotel.reg.annotation_for(reg_id)
     if ann_row is None:
         raise ValueError(f"R:{reg_id} has no annotation")
-    ann = Annotation.model_validate(ann_row.payload)
+    data = load_annotation(ann_row, hotel.blobs)
+    if data is None:
+        raise ValueError(f"annotation of R:{reg_id} was forgotten")
+    ann = Annotation.model_validate(data)
     lob = lobby or hotel.lobby()
     ids: list[str] = []
     for c in ann.claims:

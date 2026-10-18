@@ -60,6 +60,7 @@ class Profile:
     effort: dict
     require_training_optout: bool
     key_env_fallback: str | None = None
+    price: dict | None = None  # {"in": usd_per_mtok, "out": usd_per_mtok}; set in config to log cost
 
     def key(self) -> str:
         k = os.environ.get(self.key_env) or (os.environ.get(self.key_env_fallback) if self.key_env_fallback else None)
@@ -73,10 +74,10 @@ def get_profile(cfg: dict, name: str | None = None) -> Profile:
     name = name or cfg.get("llm", "mercury")
     if name not in profiles:
         raise LLMError(f"unknown llm profile {name!r}; known: {', '.join(profiles)}")
-    p = profiles[name]
+    p = {**DEFAULT_PROFILES.get(name, {}), **cfg.get("llm_profiles", {}).get(name, {})}  # partial overrides ok
     return Profile(name=name, base_url=p["base_url"], model=p["model"], key_env=p["key_env"],
                    effort=p.get("effort", {}), require_training_optout=p.get("require_training_optout", False),
-                   key_env_fallback=p.get("key_env_fallback"))
+                   key_env_fallback=p.get("key_env_fallback"), price=p.get("price"))
 
 
 def http_chat(profile: Profile, cfg: dict, body: dict) -> bytes:
@@ -113,9 +114,10 @@ class LLM:
         self.role = role
         self.gateway = gateway or hotel.gateway
         self.transport = transport or (lambda body: http_chat(self.profile, hotel.cfg, body))
-        self.tool_name = f"llm.{self.profile.name}"
-        if self.tool_name not in self.gateway.tools:
-            self.gateway.register(ToolSpec(self.tool_name, "model", self.profile.name, self._call))
+        self.tool_name = f"llm.{self.profile.name}.{role}"
+        # (re)register: the newest instance for a profile+role owns the tool, so
+        # an agent and its verifier on the same profile never share a transport
+        self.gateway.register(ToolSpec(self.tool_name, "model", self.profile.name, self._call))
 
     @property
     def name(self) -> str:
@@ -123,10 +125,17 @@ class LLM:
 
     def _call(self, body: dict) -> ToolResult:
         raw = self.transport(body)
-        msg = json.loads(raw)["choices"][0]["message"]
-        return ToolResult(raw, msg.get("content") or "", msg, self.profile.name)
+        resp = json.loads(raw)
+        msg = resp["choices"][0]["message"]
+        u = resp.get("usage") or {}
+        meta = {"model": self.profile.model,
+                "tokens_in": u.get("prompt_tokens"), "tokens_out": u.get("completion_tokens")}
+        price = self.profile.price  # USD per 1M tokens, only if configured
+        if price and meta["tokens_in"] is not None and meta["tokens_out"] is not None:
+            meta["cost_usd"] = round(meta["tokens_in"] * price["in"] / 1e6 + meta["tokens_out"] * price["out"] / 1e6, 6)
+        return ToolResult(raw, msg.get("content") or "", msg, self.profile.name, meta)
 
-    def chat(self, messages: list[dict], *, tools: list[dict] | None = None, tool_choice: str | None = None,
+    def chat(self, messages: list[dict], *, tools: list[dict] | None = None, tool_choice: str | dict | None = None,
              json_schema: dict | None = None, max_tokens: int = 4096, actor: str | None = None):
         body: dict = {"model": self.profile.model, "messages": messages, "max_completion_tokens": max_tokens}
         effort = self.profile.effort.get(self.role)

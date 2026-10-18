@@ -39,3 +39,12 @@ class BlobStore:
 
     def exists(self, h: str) -> bool:
         return self._path(h).exists()
+
+    def delete(self, h: str) -> bool:
+        """Irreversibly remove content (forget). Reg rows keep the hash, so the
+        hash chain stays intact; reads raise FileNotFoundError afterwards."""
+        p = self._path(h)
+        if p.exists():
+            p.unlink()
+            return True
+        return False

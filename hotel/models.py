@@ -108,8 +108,18 @@ class PromoteOp(Strict):
     text: str
 
 
+class MoveOp(Strict):
+    """Topics drift. A move re-files a live entry into another room: a copy (same
+    type, origin, body, tags/refs) is appended there and the original is
+    superseded by it. History stays in the old room."""
+    op: Literal["move"]
+    id: str
+    room: str
+    reason: str
+
+
 EditOp = Annotated[
-    Union[AppendOp, TagOp, LinkOp, RefOp, CloseOp, SupersedeOp, ContestOp, ReopenOp, PromoteOp],
+    Union[AppendOp, TagOp, LinkOp, RefOp, CloseOp, SupersedeOp, ContestOp, ReopenOp, PromoteOp, MoveOp],
     Field(discriminator="op"),
 ]
 EDIT_OP = TypeAdapter(EditOp)

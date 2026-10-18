@@ -16,7 +16,7 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass, field
 
-from .gateway import Gateway
+from .gateway import Gateway, load_annotation
 from .grammar import parse
 from .librarian import Librarian, ModelLibrarian, RuleLibrarian, build_context
 from .models import AppendOp, CloseOp, ContestOp, PromoteOp, ReopenOp, SupersedeOp, op_load
@@ -47,6 +47,7 @@ class _ShadowHotel:
         from .derived import Derived
         import sqlite3
         self.reg = hotel.reg
+        self.blobs = hotel.blobs
         self.cfg = hotel.cfg
         self.derived = Derived.__new__(Derived)
         self.derived.conn = sqlite3.connect(":memory:")
@@ -85,8 +86,9 @@ def replay(hotel, session_id: str, librarian: Librarian | str = "rule",
     rep = ReplayReport(librarian.name, text, actual)
     rag_counter = hotel.rag.next_id() + 1000  # synthetic ids, never written
 
-    def apply_list(ops, origin, ts, label, record_ids=None):
+    def apply_list(ops, origin, ts, label, record_ids=None, days="cfg"):
         nonlocal text, rag_counter
+        days = hotel.cfg.get("bounty_revalidate_days") if days == "cfg" else days
         before = text
         try:
             for i, op in enumerate(ops):
@@ -94,7 +96,8 @@ def replay(hotel, session_id: str, librarian: Librarian | str = "rule",
                 rid = None
                 if isinstance(op, PromoteOp):
                     rid, rag_counter = rag_counter, rag_counter + 1
-                res = apply_op(text, op, origin=origin, ts=ts, rag_id=rid)
+                res = apply_op(text, op, origin=origin, ts=ts, rag_id=rid,
+                               revalidate_days=days)
                 text = res.text
                 if record_ids and i < len(record_ids):
                     for old_id, new_id in zip(record_ids[i], res.created):
@@ -120,7 +123,7 @@ def replay(hotel, session_id: str, librarian: Librarian | str = "rule",
             else:
                 ops = [op_load(o) for o in p["ops"]]
                 apply_list(ops, p.get("origin", "user"), p.get("ts") or r.ts,
-                           f"R:{r.id} user edit", p.get("created"))
+                           f"R:{r.id} user edit", p.get("created"), days=p.get("revalidate_days"))
         elif r.kind == "annotation" and r.status == "ok":
             ctx = build_context(shadow, r.ref_id, shadow.lobby())
             out = librarian.propose(ctx)
@@ -131,9 +134,10 @@ def replay(hotel, session_id: str, librarian: Librarian | str = "rule",
                     continue
                 queued = isinstance(op, (SupersedeOp, ContestOp, ReopenOp, PromoteOp))
                 if isinstance(op, CloseOp):  # same deterministic rule as live policy
-                    ann = hotel.reg.annotation_for(int(op.closed_by[2:])) if op.closed_by.startswith("R:") else None
+                    ann_row = hotel.reg.annotation_for(int(op.closed_by[2:])) if op.closed_by.startswith("R:") else None
+                    ann = load_annotation(ann_row, hotel.blobs) if ann_row and ann_row.actor == "user" else None
                     queued = not (ann and any(c["relation"] == "supports" and op.id in c["lobby_refs"]
-                                              for c in ann.payload["claims"]))
+                                              for c in ann["claims"]))
                 if queued and not approve_queued:
                     rep.log.append(f"   {op.op} {getattr(op, 'id', '')}: queued (not applied)")
                     continue

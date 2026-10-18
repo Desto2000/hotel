@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from .grammar import ROOM_SLUG, TRANSITIONS, creation_sigil, parse, render_entry
 from .models import (
-    AppendOp, CloseOp, ContestOp, LinkOp, PromoteOp, RefOp, ReopenOp, SupersedeOp, TagOp,
+    AppendOp, CloseOp, ContestOp, LinkOp, MoveOp, PromoteOp, RefOp, ReopenOp, SupersedeOp, TagOp,
 )
 
 
@@ -59,9 +59,28 @@ def _append_entry(lob, lines, room, block):
         lines += ["", f"== ROOM: {room} ==", ""] + block
 
 
-def apply_op(text: str, op, *, origin: str, ts: str, rag_id: int | None = None) -> OpResult:
+def apply_op(text: str, op, *, origin: str, ts: str, rag_id: int | None = None,
+             revalidate_days: int | None = None) -> OpResult:
     lob = parse(text)
     lines = list(lob.lines)
+
+    if isinstance(op, MoveOp):
+        e = _need(lob, op.id)
+        if e.sigil not in (" ", "."):
+            raise OpError(f"only open/static entries move (closed/contested history stays put); {e.id} is [{e.sigil}]")
+        if op.room == e.room:
+            raise OpError(f"{e.id} is already in {op.room}")
+        nid = lob.next_id()
+        _add_meta(lines, e, "superseded-by", nid)
+        lines.insert(e.end + 2, f"  + note: moved to {op.room} — {' '.join(op.reason.split()) or 'refiled'}")
+        _set_sigil(lines, e, "~")
+        lob2 = parse(_join(lines))
+        keep = [(k, v) for k, v in e.meta if k in ("tag", "ref", "link")]
+        block = render_entry(nid, e.sigil, e.type, e.origin, ts, e.text,
+                             [("supersedes", e.id), ("moved-from", e.room)] + keep)
+        lines2 = list(lob2.lines)
+        _append_entry(lob2, lines2, op.room, block)
+        return OpResult(_join(lines2), [nid], [e.id])
 
     if isinstance(op, AppendOp):
         nid = lob.next_id()
@@ -85,6 +104,11 @@ def apply_op(text: str, op, *, origin: str, ts: str, rag_id: int | None = None) 
         if e.type == "bounty" and not op.closed_by.startswith("R:"):
             raise OpError("a bounty closes only through a Reg retrieval (closed-by: R:<n>)")
         _add_meta(lines, e, "closed-by", op.closed_by)
+        if e.type == "bounty" and revalidate_days:
+            # web facts expire: the custodian flags this bounty when the date passes
+            from datetime import datetime, timedelta
+            due = (datetime.strptime(ts[:10], "%Y-%m-%d") + timedelta(days=revalidate_days)).strftime("%Y-%m-%d")
+            lines.insert(e.end + 2, f"  + revalidate: {due}")
         _set_sigil(lines, e, "x")
         return OpResult(_join(lines), [], [e.id])
 

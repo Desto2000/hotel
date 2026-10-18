@@ -4,12 +4,29 @@ A personal information harness that replaces "chat with AI" as note-taking. It i
 product. Everything goes through a logged **Reg**. The durable output is one living plain-text
 document, the **lobby**.
 
+## Install (system-wide, reproducible)
+
 ```
-uv sync
-uv run hotel init ~/lobby          # creates lobby.txt (git) + .hotel/ (Reg, blobs, indexes)
-export HOTEL_HOME=~/lobby
-uv run hotel                       # TUI (Calculus theme, ctrl+t toggles dark/light)
-uv run pytest -q
+git clone <this repo> hotel && cd hotel
+scripts/install.sh  [~/lobby]          # Git Bash / macOS / Linux
+scripts\install.ps1 [-LobbyDir ~\lobby] # PowerShell
+```
+
+What makes it reproducible: `.python-version` pins the interpreter (uv downloads it),
+`constraints.txt` pins every dependency (exported from `uv.lock`; regenerate with
+`uv export --frozen --no-hashes --no-emit-project --no-dev -o constraints.txt`), and the CLI is
+installed as an isolated `uv tool`, so `hotel` is on PATH and independent of any project venv.
+The lobby itself is reproducible from `hotel backup` (below). After pulling new code, rerun the
+install script; the tool is a pinned copy, not a live checkout.
+
+`hotel` finds its home in this order: `--home`, `HOTEL_HOME`, the nearest parent directory
+containing `.hotel/`, then the per-user default in `~/.config/hotel/home` (set by `hotel init`
+or `hotel home <dir>`). So `hotel` works from any directory. `hotel doctor` checks the whole chain.
+
+Development:
+
+```
+uv sync && uv run pytest -q
 ```
 
 Env: `EXA_API_KEY` (falls back to `MCP_EXA_API_KEY`), `INCEPTION_API_KEY` (Mercury, the default model
@@ -35,7 +52,8 @@ profile), optionally `PARALLEL_API_KEY`, or `GROQ_API_KEY` for the `groq` profil
 | RAG with one-way refs, logged promotion with backlink | done | `rag.py`, `PromoteOp` |
 | Replay harness: re-run a session with another librarian, diff lobbies | done | `replay.py` |
 | Directory layer (regenerated, open entries only) | done | `derived.py` |
-| sqlite-vec embeddings, talk/solve agents, guests, concierge/custodian, hotel renderer | **not built** | — |
+| sqlite-vec embeddings, talk/solve agents, concierge, custodian dedup, hotel renderer | **not built** | — |
+| Guest agent (drafts → review → origin=approved), custodian staleness, move op, forget, backup/restore, verifier, usage logging, system install | done (v0.2) | `guest.py`, `core.py`, `backup.py`, `verify.py`, `scripts/` |
 
 ## Lobby grammar
 
@@ -61,6 +79,50 @@ meta lines, insertion anywhere except the end of a room, illegal status moves, o
 supersession, a bounty closed without an annotated `R:<n>`, and resident entries of any type
 other than `log`. Hand edits to `lobby.txt` are allowed. They are validated against git HEAD
 when the TUI starts (and by `hotel check`), then committed as user edits.
+
+## Guest mode: the note-taking loop
+
+`/guest` in the TUI (or `hotel guest "…" --note`). Every line you type is appended to the lobby as
+your monologue (origin=user), so your side of the conversation is the note. The guest replies in
+the Guest tab. It can read the lobby, search the web (gated, same rules as every agent), and
+`propose` edits: an idea, a bounty, a supersede, a tag, a move. Each proposal is dry-run against
+the validator, deduplicated, and parked in Review; `/approve R:n` writes it with origin=approved.
+The guest's reply itself never enters the lobby. Start a line with `>` to talk without writing it
+down ("> yes, draft it"). Messages queue: a second one waits for the first turn to finish.
+
+## Data safety
+
+- **Concurrent writers:** every lobby write holds a cross-process lock for read → validate →
+  write → commit. Uncommitted editor changes are validated and committed before the write. Tested
+  with two OS processes writing 30 entries at the same time.
+- **Backup:** `hotel backup [dir]` (default `~/hotel-backups`) is incremental. Blobs are copied
+  once (content-addressed); each snapshot holds SQLite online-backup copies of the Reg and RAG, a
+  `git bundle` of the lobby's full history, and a manifest. `hotel restore <dir> <empty-target>`
+  verifies the hash chain, every referenced blob and the lobby before reporting success.
+- **Forgetting:** `hotel forget R:n --reason …` deletes the content behind a row: result, text,
+  arguments (queries and prompts), and the annotation quotes. The rows and hash chain stay; only
+  the hash-addressed bytes are gone. Not covered: lobby text (it lives in git history; use
+  `git filter-repo`), rows written before v0.2 (they held args and annotations inline), and
+  existing backups (prune them).
+
+## Lifecycle
+
+- **Staleness:** closing a bounty adds `+ revalidate: <date>` (`bounty_revalidate_days`, default
+  90). `hotel custodian` / `/custodian` tags stale bounties and logs that they need rechecking.
+  It never re-answers; you re-run `/research` and supersede.
+- **Rooms drift:** `/move L0004 embeddings [why]` copies a live entry (same type, origin, body,
+  tags, refs) into the new room with `moved-from`, and supersedes the original. Closed or contested
+  history stays where it happened. Resident moves go to review.
+
+## Model checks and cost
+
+- **Entailment verifier:** set `"verifier": "<llm profile>"` in `.hotel/config.json`. Every
+  model-written claim is then judged against its own quote (entailed / overreach / unsupported)
+  before the annotation is accepted; overreach goes back to the agent with the reason. Use a
+  different model from the agent: a model grading itself shares its blind spots.
+- **Usage:** every model row records `tokens_in`, `tokens_out` and `ms`; with
+  `"llm_profiles": {"mercury": {"price": {"in": …, "out": …}}}` (USD per 1M tokens) it also records
+  `cost_usd`. No prices are built in; set the ones you pay.
 
 ## Research agent
 
@@ -99,6 +161,8 @@ Plain text appends a monologue to the current room. Commands:
 /close L R:n     /supersede L <text>   /contest L <why>   /reopen L <why>
 /tag L t         /link L L   /ref L R:n   /promote L
 /research L      run the research agent    /accept R:n keep its answer
+/guest [new|off] guest mode               > line = talk only   /talk <msg>
+/move L room     /custodian               /backup [dir]
 /lib [R:n]       (ctrl+l) run librarian    /approve R:n   /reject R:n
 /blob R:n        /check   /verify   /theme (ctrl+t)
 ```
@@ -108,4 +172,4 @@ unchanged. UI roles map to Zed keys, and lobby syntax maps to Zed syntax scopes.
 
 ## CLI
 
-`hotel add|search|annotate <json>|lib <rid>|research <L>|accept <rid>|timings|render|snapshot|review list|approve|reject|check|verify|rebuild|reg|replay <session>|rag-import|sessions|schema`
+`hotel add|search|annotate <json>|lib <rid>|research <L>|guest "<msg>" [--note]|accept <rid>|move <L> <room>|custodian|backup [dir]|restore <src> <dst>|forget <rid> --reason|home [dir]|doctor|version|timings|render|snapshot|review list|approve|reject|check|verify|rebuild|reg|replay <session>|rag-import|sessions|schema`

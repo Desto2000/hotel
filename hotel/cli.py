@@ -14,8 +14,59 @@ def _hotel(args, **kw):
     from .core import Hotel
     root = Path(args.home).resolve() if args.home else find_root()
     if root is None or not (root / ".hotel").is_dir():
-        sys.exit("no hotel home found — run `hotel init <dir>` or set HOTEL_HOME")
+        sys.exit("no hotel home found — run `hotel init <dir>`, `hotel home <dir>`, or set HOTEL_HOME")
     return Hotel(Paths(root), **kw)
+
+
+def doctor(args) -> int:
+    """Check the install end to end; exit 1 on any hard failure."""
+    import os
+    import shutil
+    import sqlite3
+
+    from . import __version__
+    from .config import USER_HOME_FILE
+    ok = True
+
+    def line(good: bool | None, what: str, detail: str = ""):
+        nonlocal ok
+        mark = {True: "ok  ", False: "FAIL", None: "warn"}[good]
+        ok = ok and good is not False
+        print(f"[{mark}] {what}{(' — ' + detail) if detail else ''}")
+
+    line(True, f"hotel {__version__}", f"python {sys.version.split()[0]} at {sys.executable}")
+    try:
+        c = sqlite3.connect(":memory:")
+        c.execute("create virtual table t using fts5(x)")
+        line(True, "sqlite FTS5", sqlite3.sqlite_version)
+    except Exception as ex:
+        line(False, "sqlite FTS5", str(ex))
+    line(shutil.which("git") is not None, "git on PATH", shutil.which("git") or "missing")
+    root = Path(args.home).resolve() if args.home else find_root()
+    src = ("--home" if args.home else "HOTEL_HOME" if os.environ.get("HOTEL_HOME")
+           else f"default ({USER_HOME_FILE})" if root else "none")
+    line(root is not None, "hotel home", f"{root} via {src}" if root else "run `hotel init <dir>`")
+    if root:
+        from .core import Hotel
+        h = Hotel(Paths(root))
+        probs = h.check()
+        line(not probs, "lobby valid vs git HEAD", "; ".join(probs[:2]))
+        chain = h.reg.verify_chain()
+        line(not chain, "reg hash chain", f"{len(h.reg.list(limit=10**9))} rows" if not chain else chain[0])
+        pend = h.gateway.pending()
+        line(None if pend else True, "annotation gate", "locked by " + ", ".join(p.rid for p in pend) if pend else "open")
+        from .backup import latest_snapshot
+        bdir = Path(h.cfg.get("backup_dir") or "~/hotel-backups").expanduser()
+        try:
+            line(True, "latest backup", latest_snapshot(bdir).name)
+        except FileNotFoundError:
+            line(None, "latest backup", f"none under {bdir} — run `hotel backup`")
+    for env, what in [("EXA_API_KEY", "Exa (falls back to MCP_EXA_API_KEY)"), ("INCEPTION_API_KEY", "Mercury"),
+                      ("PARALLEL_API_KEY", "Parallel (optional)"), ("GROQ_API_KEY", "Groq profile (optional)")]:
+        have = bool(os.environ.get(env) or (env == "EXA_API_KEY" and os.environ.get("MCP_EXA_API_KEY"))
+                    or (env == "GROQ_API_KEY" and os.environ.get("HERMES_CUSTOM_GROQ_API_KEY")))
+        line(True if have else None, f"{env}", what if have else f"not set — {what} unavailable")
+    return 0 if ok else 1
 
 
 def main(argv=None):
@@ -48,12 +99,53 @@ def main(argv=None):
     s.add_argument("--cmd", dest="commands", action="append", default=[]); s.add_argument("--svg"); s.add_argument("--keys", action="append", default=[])
     s.add_argument("--size", default="190x46"); s.add_argument("--wait", type=float, default=0.5)
     sub.add_parser("schema", help="print the librarian JSON schema")
+    sub.add_parser("version")
+    sub.add_parser("doctor", help="check install, home, lobby, reg chain, backups, keys")
+    s = sub.add_parser("home", help="show or set the default hotel home used from any directory")
+    s.add_argument("dir", nargs="?")
+    s = sub.add_parser("backup", help="incremental backup (reg, rag, blobs, lobby git bundle)")
+    s.add_argument("dest", nargs="?")
+    s = sub.add_parser("restore", help="restore the latest (or given) snapshot into an empty dir")
+    s.add_argument("src"); s.add_argument("target"); s.add_argument("--snapshot")
+    s = sub.add_parser("forget", help="irreversibly delete the content behind a Reg row (row stays)")
+    s.add_argument("reg_id", type=int); s.add_argument("--reason", required=True)
+    sub.add_parser("custodian", help="flag closed bounties whose evidence is due for revalidation")
+    s = sub.add_parser("move", help="move a live entry to another room"); s.add_argument("entry"); s.add_argument("room")
+    s.add_argument("--reason", default="refiled")
+    s = sub.add_parser("guest", help="one-shot message to a guest (drafts go to the review queue)")
+    s.add_argument("message"); s.add_argument("--llm"); s.add_argument("--note", action="store_true",
+                                                                       help="also append your message as a monologue")
+    s.add_argument("--room")
 
     a = p.parse_args(argv)
+    if a.cmd == "version":
+        from . import __version__
+        print(__version__)
+        return
+    if a.cmd == "doctor":
+        sys.exit(doctor(a))
+    if a.cmd == "home":
+        from .config import set_default_home
+        if a.dir:
+            d = Path(a.dir).expanduser().resolve()
+            if not (d / ".hotel").is_dir():
+                sys.exit(f"{d} is not a hotel home (no .hotel/); run `hotel init {d}` first")
+            set_default_home(d)
+        print(find_root() or "(no default home)")
+        return
+    if a.cmd == "restore":
+        from .backup import restore
+        info = restore(Path(a.src), Path(a.target), a.snapshot)
+        print(json.dumps(info, indent=2))
+        sys.exit(1 if info["problems"] else 0)
     if a.cmd == "init":
+        from .config import USER_HOME_FILE, set_default_home
         from .core import init_home
         paths = init_home(Path(a.dir))
         print(f"initialised hotel home at {paths.root}")
+        if not USER_HOME_FILE.exists():
+            set_default_home(paths.root)
+            print(f"set as default home ({USER_HOME_FILE}); `hotel` now works from any directory")
         return
     if a.cmd == "schema":
         from .models import LibrarianOutput
@@ -171,6 +263,35 @@ def main(argv=None):
     elif a.cmd == "snapshot":
         from .snapshot import snapshot
         print(snapshot(h, a.commands, a.keys, a.svg, a.size, a.wait))
+    elif a.cmd == "backup":
+        from .backup import backup
+        info = backup(h.paths, Path(a.dest or h.cfg.get("backup_dir") or "~/hotel-backups"))
+        print(json.dumps(info, indent=2))
+    elif a.cmd == "forget":
+        info = h.forget(a.reg_id, a.reason)
+        print(f"forgot R:{a.reg_id}: {info['deleted']} of {len(info['blobs'])} blobs deleted; rows and chain intact")
+        print("note: lobby text and earlier backups are not touched — rewrite git history / prune backups if needed")
+    elif a.cmd == "custodian":
+        for r in h.custodian():
+            print(f"{r.route:<8} {r.op.op} {getattr(r.op, 'id', getattr(r.op, 'room', ''))}  {r.reason}")
+    elif a.cmd == "move":
+        from .models import MoveOp
+        r = h.apply([MoveOp(op="move", id=a.entry, room=a.room, reason=a.reason)])
+        print(f"{a.entry} -> {r.created[0]} in {a.room}  commit {r.commit[:8]}")
+    elif a.cmd == "guest":
+        from .guest import Guest
+        from .llm import LLM
+        note = None
+        if a.note:
+            from .models import AppendOp
+            note = h.apply([AppendOp(op="append", room=a.room or h.cfg.get("default_room", "inbox"),
+                                     type="monologue", body=a.message, refs=[], tags=[])]).created[0]
+        g = Guest(h, LLM(h, a.llm, role="agent"), on_event=lambda s: print("  ·", s))
+        t = g.say(a.message, note)
+        print()
+        print(t.reply or "(no reply) " + "; ".join(t.log[-2:]))
+        if t.proposals:
+            print("drafts in review: " + " ".join(f"R:{p}" for p in t.proposals) + "  (hotel review approve <id>)")
     elif a.cmd == "rag-import":
         text = Path(a.file).read_text(encoding="utf-8")
         rid = h.rag.add("import", str(Path(a.file).resolve()), a.title or Path(a.file).name, text)

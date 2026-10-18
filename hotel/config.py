@@ -66,6 +66,8 @@ DEFAULT_CONFIG = {
     "librarian_output_mode": "json_schema",  # or "json_object"
     "search_backend": "exa",  # "exa" | "parallel" for agent fan-out
     "agent_max_searches": 4,
+    "bounty_revalidate_days": 90,  # closed bounties get `+ revalidate: <date>`; custodian flags them after
+    "verifier": None,  # llm profile that checks model-written claims against their quotes (None = off)
     "agent_num_results": 3,  # per query; agent retrievals stay small (context is a budget)
     "agent_highlight_chars": 700,
     "agent_budget_chars": 40000,  # transcript size before annotated retrievals are compacted
@@ -81,7 +83,12 @@ DEFAULT_CONFIG = {
 }
 
 
+USER_HOME_FILE = Path.home() / ".config" / "hotel" / "home"
+
+
 def find_root(start: Path | None = None) -> Path | None:
+    """HOTEL_HOME env -> nearest ancestor with .hotel/ -> per-user default
+    (~/.config/hotel/home, written by `hotel init` / `hotel home`)."""
     env = os.environ.get("HOTEL_HOME")
     if env:
         return Path(env).expanduser().resolve()
@@ -89,7 +96,16 @@ def find_root(start: Path | None = None) -> Path | None:
     for cand in [p, *p.parents]:
         if (cand / ".hotel").is_dir():
             return cand
+    if USER_HOME_FILE.exists():
+        d = Path(USER_HOME_FILE.read_text(encoding="utf-8").strip()).expanduser()
+        if (d / ".hotel").is_dir():
+            return d.resolve()
     return None
+
+
+def set_default_home(root: Path) -> None:
+    USER_HOME_FILE.parent.mkdir(parents=True, exist_ok=True)
+    USER_HOME_FILE.write_text(str(root.resolve()) + "\n", encoding="utf-8")
 
 
 def load_config(paths: Paths) -> dict:

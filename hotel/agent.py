@@ -97,6 +97,45 @@ def quote_hint(text: str, quote: str) -> str:
             f"{text[e:e + 90]!r} — not {' '.join(words[n:n + 8])!r}. Quote one contiguous span.")
 
 
+def model_annotate(hotel, args: dict, actor: str, verifier_transport=None):
+    """Turn a model's `annotate` tool call into a verified annotation.
+    Returns (message_for_model, reg_row_or_None, claims). Every rejection is a
+    concrete instruction the model can act on."""
+    target = args.get("target")
+    if isinstance(target, str):
+        target = int(re.sub(r"\D", "", target) or 0)
+    entry = hotel.reg.get(int(target or 0))
+    if entry is None or entry.kind != "retrieval":
+        return (f"ERROR: R:{target} is not a retrieval. Pending: "
+                + ", ".join(p.rid for p in hotel.gateway.pending()), None, [])
+    text = hotel.blobs.text(entry.text_hash)
+    claims, errs = [], []
+    for i, c in enumerate(args.get("claims") or [], 1):
+        ptr = make_pointer(text, entry.text_hash, str(c.get("quote", "")))
+        if ptr is None:
+            errs.append(f"claim {i}: quote is not contiguous text from R:{entry.id}. {quote_hint(text, str(c.get('quote', '')))}")
+            continue
+        try:
+            claims.append(Claim(text=str(c.get("text", "")).strip() or "(empty)", pointer=ptr,
+                                relation=c.get("relation", "new"), lobby_refs=list(c.get("lobby_refs") or [])))
+        except Exception as ex:
+            errs.append(f"claim {i}: {ex}")
+    if not errs and claims and hotel.cfg.get("verifier"):
+        from .verify import verify_claims
+        verdicts = verify_claims(hotel, [{"text": c.text, "quote": c.pointer.quote} for c in claims],
+                                 hotel.cfg["verifier"], transport=verifier_transport)
+        for v, c in zip(verdicts, claims):
+            if v.get("verdict") != "entailed":
+                errs.append(f"claim {v['i']} ({c.text[:60]!r}): verifier says {v.get('verdict')} — {v.get('why', '')}. "
+                            "Narrow the claim to exactly what the quote states, or drop it.")
+    if errs:
+        return "ERROR: annotation rejected — fix and call annotate again:\n- " + "\n- ".join(errs), None, []
+    ann = Annotation(target=entry.id, claims=claims, caused=str(args.get("caused") or "").strip() or "unspecified",
+                     caused_refs=list(args.get("caused_refs") or []))
+    row = hotel.gateway.annotate(ann, actor=actor)
+    return f"OK: annotation R:{row.id} recorded for R:{entry.id} ({len(claims)} claims).", row, claims
+
+
 @dataclass
 class RunResult:
     bounty: str
@@ -117,8 +156,9 @@ class RunResult:
 
 class ResearchAgent:
     def __init__(self, hotel, llm: LLM | None = None, *, max_turns: int = 14, max_searches: int = 4,
-                 fanout: int = 3, budget_chars: int = 60_000, on_event=None):
+                 fanout: int = 3, budget_chars: int = 60_000, on_event=None, verifier_transport=None):
         self.h = hotel
+        self.verifier_transport = verifier_transport
         self.llm = llm or LLM(hotel, role="agent")
         self.max_turns, self.max_searches, self.fanout = max_turns, max_searches, fanout
         self.budget_chars = budget_chars
@@ -192,33 +232,12 @@ class ResearchAgent:
             return f"ERROR: {type(ex).__name__}: {str(ex)[:300]}", None
 
     def _annotate(self, args: dict, run: RunResult, state: dict) -> str:
-        target = args.get("target")
-        if isinstance(target, str):
-            target = int(re.sub(r"\D", "", target) or 0)
-        entry = self.h.reg.get(int(target or 0))
-        if entry is None or entry.kind != "retrieval":
-            return f"ERROR: R:{target} is not a retrieval. Pending: " + ", ".join(p.rid for p in self.h.gateway.pending())
-        text = self.h.blobs.text(entry.text_hash)
-        claims, errs = [], []
-        for i, c in enumerate(args.get("claims") or [], 1):
-            ptr = make_pointer(text, entry.text_hash, str(c.get("quote", "")))
-            if ptr is None:
-                errs.append(f"claim {i}: quote is not contiguous text from R:{entry.id}. {quote_hint(text, str(c.get('quote', '')))}")
-                continue
-            try:
-                claims.append(Claim(text=str(c.get("text", "")).strip() or "(empty)", pointer=ptr,
-                                    relation=c.get("relation", "new"), lobby_refs=list(c.get("lobby_refs") or [])))
-            except Exception as ex:
-                errs.append(f"claim {i}: {ex}")
-        if errs:
-            return "ERROR: annotation rejected — fix and call annotate again:\n- " + "\n- ".join(errs)
-        ann = Annotation(target=entry.id, claims=claims, caused=str(args.get("caused") or "").strip() or "unspecified",
-                         caused_refs=list(args.get("caused_refs") or []))
-        row = self.h.gateway.annotate(ann, actor="agent")
-        run.annotations.append(row.id)
-        state["ann_text"][entry.id] = "; ".join(f"[{c.relation}] {c.text} — \"{c.pointer.quote}\"" for c in claims) \
-            or f"(no claims: {ann.caused})"
-        return f"OK: annotation R:{row.id} recorded for R:{entry.id} ({len(claims)} claims)."
+        msg, row, claims = model_annotate(self.h, args, "agent", self.verifier_transport)
+        if row is not None:
+            run.annotations.append(row.id)
+            state["ann_text"][row.ref_id] = "; ".join(
+                f"[{c.relation}] {c.text} — \"{c.pointer.quote}\"" for c in claims) or "(no claims)"
+        return msg
 
     # ----------------------------------------------------------- loop
     def run(self, bounty_id: str) -> RunResult:

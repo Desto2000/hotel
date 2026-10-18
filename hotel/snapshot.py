@@ -34,7 +34,9 @@ def snapshot(hotel, commands: list[str], keys: list[str] | None = None, svg: str
                 app.query_one("#cmd").value = c
                 await pilot.press("enter")
                 await pilot.pause(wait)
-                await app.workers.wait_for_complete()
+                # thread workers: poll until every worker has finished
+                while any(not w.is_finished for w in app.workers):
+                    await pilot.pause(0.2)
                 await pilot.pause()
             for k in keys or []:
                 await pilot.press(k)
@@ -56,7 +58,7 @@ def snapshot(hotel, commands: list[str], keys: list[str] | None = None, svg: str
                 "--- lobby ---", _plain(app.query_one("#lobby")).rstrip(),
                 f"--- side tab: {tabs.active} ---",
             ]
-            pane = {"t-res": "#results", "t-rev": "#review", "t-blob": "#blob"}.get(tabs.active)
+            pane = {"t-res": "#results", "t-rev": "#review", "t-blob": "#blob", "t-guest": "#guest"}.get(tabs.active)
             if pane:
                 out.append(_plain(app.query_one(pane)).rstrip()[:4000])
             else:

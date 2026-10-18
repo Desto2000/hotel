@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import shlex
+import threading
+from pathlib import Path
 
 from rich.text import Text
 from textual import on, work
@@ -23,9 +25,9 @@ from textual.widgets import (
 from .core import Hotel, ValidationFailed
 from .gateway import AnnotationRejected, GateBlocked, make_pointer
 from .grammar import SIGIL_NAMES
-from .librarian import get_librarian, run_librarian
+from .librarian import run_librarian
 from .models import (
-    Annotation, AppendOp, Claim, CloseOp, ContestOp, LinkOp, PromoteOp, RefOp, ReopenOp, SupersedeOp, TagOp,
+    Annotation, AppendOp, Claim, CloseOp, ContestOp, LinkOp, MoveOp, PromoteOp, RefOp, ReopenOp, SupersedeOp, TagOp,
 )
 from .ops import OpError
 from .render import highlight_lobby
@@ -40,7 +42,10 @@ HELP = """[b]write[/b]   plain text → monologue in current room · /bounty /go
 [b]gate[/b]    /annotate [R:n] (ctrl+a) — required after every external retrieval
 [b]edit[/b]    /close L R:n · /supersede L <text> · /contest L <why> · /reopen L <why>
         /tag L t · /link L L · /ref L R:n · /promote L
+[b]guest[/b]   /guest (on) · /guest new · /guest off — your lines become notes, the guest replies, drafts → Review
+        in guest mode, start a line with > to talk without writing it down (e.g. "> yes, draft it") · /talk <msg>
 [b]agent[/b]   /research L#### (one bounty per run) · /accept R:n keep an answer as an approved entry
+[b]house[/b]   /move L <room> [why] · /custodian (flag stale closed bounties) · /backup [dir]
 [b]resident[/b] /lib [R:n] run librarian · /approve R:n · /reject R:n
 [b]inspect[/b] /blob R:n · /check · /verify · /theme (ctrl+t) · /q"""
 
@@ -205,6 +210,10 @@ class HotelApp(App):
         self.pal_name = hotel.cfg.get("theme", "calculus-dark")
         self.room = hotel.cfg.get("default_room", "inbox")
         self.focus_id: str | None = None
+        self.guest_mode = False
+        self.guest = None
+        self.guest_log = Text()
+        self.agent_lock = threading.Lock()
         self.positions: dict[str, int] = {}
         for p in self.pals.values():  # must exist before the stylesheet is parsed
             self.register_theme(textual_theme(p))
@@ -231,6 +240,9 @@ class HotelApp(App):
                     with TabPane("Review", id="t-rev"):
                         with VerticalScroll(classes="pane-scroll"):
                             yield Static(id="review")
+                    with TabPane("Guest", id="t-guest"):
+                        with VerticalScroll(classes="pane-scroll", id="guest-scroll"):
+                            yield Static(id="guest")
                     with TabPane("Blob", id="t-blob"):
                         with VerticalScroll(classes="pane-scroll"):
                             yield Static(id="blob")
@@ -284,7 +296,10 @@ class HotelApp(App):
         else:
             t.append("open", st["created"])
         t.append(" · librarian ", st["muted"])
-        t.append(get_librarian(self.hotel).name, st["function"])
+        t.append(self.hotel.cfg.get("librarian", "rule"), st["function"])
+        if self.guest_mode:
+            t.append(" · guest ", st["muted"])
+            t.append(self.hotel.cfg.get("llm", "mercury"), st["hint"])
         n = len(self.hotel.reg.pending_reviews())
         if n:
             t.append(" · review ", st["muted"])
@@ -327,7 +342,7 @@ class HotelApp(App):
         st = self.st
         kind_style = {"retrieval": "function", "annotation": "created", "lobby_edit": "modified",
                       "model": "hint", "blocked": "deleted", "review": "sig_contested",
-                      "decision": "success", "internal": "muted", "output": "accent"}
+                      "decision": "success", "internal": "muted", "output": "accent", "redaction": "deleted"}
         for e in self.hotel.reg.list(limit=200)[::-1]:
             extra = ""
             if e.kind == "retrieval" and e.status == "ok":
@@ -385,7 +400,11 @@ class HotelApp(App):
         e = self.hotel.reg.get(rid)
         if not e or not e.text_hash:
             return self.say(f"R:{rid} has no text blob", "error")
-        self.query_one("#blob", Static).update(Text(self.hotel.blobs.text(e.text_hash), self.st["body"]))
+        try:
+            body = Text(self.hotel.blobs.text(e.text_hash), self.st["body"])
+        except FileNotFoundError:
+            body = Text(f"R:{rid}: content forgotten (see the redaction row in the Reg)", self.st["muted"])
+        self.query_one("#blob", Static).update(body)
         self.query_one(TabbedContent).active = "t-blob"
 
     # ------------------------------------------------------------- events
@@ -458,11 +477,53 @@ class HotelApp(App):
     def dispatch(self, line: str):
         h = self.hotel
         if not line.startswith("/"):
+            if self.guest_mode and line.startswith(">"):
+                # conversational turn ("yes, draft it") — talk to the guest, don't write it down
+                if h.gateway.pending():
+                    raise GateBlocked(h.gateway.pending())
+                self.say("guest thinking…")
+                return self.run_guest(line[1:].strip(), None)
             res = h.apply([AppendOp(op="append", room=self.room, type="monologue", body=line, refs=[], tags=[])])
             self.focus_id = res.created[0]
+            if self.guest_mode:
+                if h.gateway.pending():
+                    raise GateBlocked(h.gateway.pending())
+                self.say(f"+ {res.created[0]} monologue · guest thinking…", "created")
+                return self.run_guest(line, res.created[0])
             return self.say(f"+ {res.created[0]} monologue in {self.room}", "created")
         cmd, _, rest = line[1:].partition(" ")
         rest = rest.strip()
+        if cmd == "guest":
+            if rest == "new" or self.guest is None:
+                self.guest = None  # created lazily in the worker (needs the model profile)
+                self.guest_log = Text()
+            self.guest_mode = rest != "off"
+            self.render_status()
+            return self.say("guest mode " + ("on: your lines become monologue entries; the guest replies in "
+                                             "the Guest tab and drafts go to Review" if self.guest_mode else "off"))
+        if cmd == "talk":
+            if not rest:
+                raise ValueError("/talk <message>  (talk to the guest without writing a note)")
+            if h.gateway.pending():
+                raise GateBlocked(h.gateway.pending())
+            return self.run_guest(rest, None)
+        if cmd == "move":
+            parts = rest.split(maxsplit=2)
+            if len(parts) < 2:
+                raise ValueError("/move L#### <room> [reason]")
+            res = h.apply([MoveOp(op="move", id=parts[0], room=parts[1].lower(),
+                                  reason=parts[2] if len(parts) > 2 else "refiled")])
+            self.focus_id = res.created[0]
+            return self.say(f"{parts[0]} moved to {parts[1]} as {res.created[0]}", "modified")
+        if cmd == "custodian":
+            results = h.custodian()
+            return self.say(f"custodian: {len(results)} ops · " + ", ".join(f"{r.op.op} {r.route}" for r in results)
+                            if results else "custodian: nothing stale")
+        if cmd == "backup":
+            from .backup import backup
+            info = backup(h.paths, Path(rest or h.cfg.get("backup_dir") or "~/hotel-backups"))
+            return self.say(f"backup → {info['snapshot']} ({info['reg_rows']} reg rows, "
+                            f"{info['blobs_copied']} new blobs)", "success")
         args = shlex.split(rest, posix=True) if rest and cmd not in TYPE_CMDS and cmd not in (
             "s", "exa", "ls", "supersede", "contest", "reopen") else rest.split()
 
@@ -577,8 +638,47 @@ class HotelApp(App):
             self.refresh_all()
         self.call_from_thread(ui)
 
-    @work(thread=True, exclusive=True, group="agent")
+    @work(thread=True, group="agent")
+    def run_guest(self, text: str, note_id: str | None):
+        with self.agent_lock:  # turns run in order; a fast second message waits, never races
+            self._run_guest(text, note_id)
+
+    def _run_guest(self, text: str, note_id: str | None):
+        from .guest import Guest
+        h = self.hotel
+        st = self.st
+        try:
+            if self.guest is None:
+                self.guest = Guest(h, on_event=lambda s: self.call_from_thread(self.say, f"guest · {s}"))
+            turn = self.guest.say(text, note_id)
+        except Exception as ex:
+            self.call_from_thread(self.say, f"guest failed (logged): {ex}", "error")
+            self.call_from_thread(self.refresh_all)
+            return
+        log = self.guest_log
+        log.append("you" + (f" ({note_id})" if note_id else "") + "\n", st["muted"])
+        log.append(text + "\n", st["body"])
+        log.append(f"guest R:{turn.output_id}\n" if turn.output_id else "guest (no reply)\n", st["hint"])
+        log.append((turn.reply or "; ".join(turn.log[-2:])) + "\n", st["string"] if turn.reply else st["error"])
+        if turn.proposals:
+            log.append("drafts: " + " ".join(f"R:{p}" for p in turn.proposals) + "  (/approve R:n)\n", st["modified"])
+        log.append("\n")
+
+        def ui():
+            self.query_one("#guest", Static).update(log)
+            self.query_one(TabbedContent).active = "t-guest"
+            self.query_one("#guest-scroll", VerticalScroll).scroll_end(animate=False)
+            self.say(f"guest replied{' · ' + str(len(turn.proposals)) + ' draft(s) in Review' if turn.proposals else ''}",
+                     "hint")
+            self.refresh_all()
+        self.call_from_thread(ui)
+
+    @work(thread=True, group="agent")
     def run_research(self, entry_id: str):
+        with self.agent_lock:
+            self._run_research(entry_id)
+
+    def _run_research(self, entry_id: str):
         from .agent import ResearchAgent
         h = self.hotel
         agent = ResearchAgent(h, max_searches=h.cfg.get("agent_max_searches", 4),

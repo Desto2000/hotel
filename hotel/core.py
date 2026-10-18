@@ -1,0 +1,272 @@
+"""Hotel: wires Reg, blobs, gateway, lobby store, RAG, derived index, policy.
+
+All lobby writes go through `Hotel.apply()`:
+    ops -> pure text application -> validate_transition -> write file
+        -> git commit -> Reg lobby_edit row -> rebuild derived layers
+"""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from .blobs import BlobStore
+from .config import Paths, load_config, save_config, DEFAULT_CONFIG
+from .derived import Derived
+from .gateway import Gateway, ToolSpec
+from .grammar import empty_lobby, parse
+from .models import (
+    AppendOp, CloseOp, ContestOp, PromoteOp, ReopenOp, SupersedeOp, op_dump, op_load,
+)
+from .ops import OpError, apply_op
+from .rag import Rag
+from .reg import Reg, utcnow
+from .search import ExaClient, make_tools
+from .validator import validate_transition, validate_text
+
+
+class ValidationFailed(Exception):
+    def __init__(self, errors: list[str]):
+        self.errors = errors
+        super().__init__("; ".join(errors[:6]))
+
+
+class Oracle:
+    def __init__(self, reg: Reg):
+        self.reg = reg
+
+    def reg_exists(self, rid: int) -> bool:
+        return self.reg.get(rid) is not None
+
+    def is_annotated_retrieval(self, rid: int) -> bool:
+        e = self.reg.get(rid)
+        return bool(e and e.kind == "retrieval" and e.status == "ok" and self.reg.annotation_for(rid))
+
+
+def git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8")
+
+
+def init_home(root: Path) -> Paths:
+    paths = Paths(root.resolve())
+    paths.state.mkdir(parents=True, exist_ok=True)
+    paths.blobs.mkdir(exist_ok=True)
+    if not paths.config.exists():
+        save_config(paths, DEFAULT_CONFIG)
+    if not paths.lobby.exists():
+        paths.lobby.write_text(empty_lobby(), encoding="utf-8", newline="\n")
+    (root / ".gitignore").write_text(".hotel/\nlobby.directory.txt\n", encoding="utf-8")
+    (root / ".gitattributes").write_text("lobby.txt text eol=lf\n", encoding="utf-8")
+    if not (root / ".git").exists():
+        git(root, "init", "-q")
+    git(root, "add", "lobby.txt", ".gitignore", ".gitattributes")
+    _commit(root, "hotel: init lobby")
+    return paths
+
+
+def _commit(root: Path, msg: str) -> str | None:
+    ident = []
+    if not git(root, "config", "user.name").stdout.strip():
+        ident = ["-c", "user.name=hotel", "-c", "user.email=hotel@localhost"]
+    r = git(root, *ident, "commit", "-q", "-m", msg)
+    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+        raise RuntimeError(f"git commit failed: {r.stderr.strip() or r.stdout.strip()}")
+    return git(root, "rev-parse", "HEAD").stdout.strip() or None
+
+
+@dataclass
+class ApplyResult:
+    created: list[str]
+    touched: list[str]
+    commit: str | None
+    reg_id: int
+    skipped: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RouteResult:
+    op: object
+    route: str  # applied | queued | rejected | noop
+    reason: str
+    detail: str = ""
+
+
+class Hotel:
+    def __init__(self, paths: Paths, session_id: str | None = None, new_session: bool = False):
+        self.paths = paths
+        self.cfg = load_config(paths)
+        self.blobs = BlobStore(paths.blobs)
+        self.reg = Reg(paths.reg_db)
+        self.rag = Rag(paths.rag_db)
+        self.derived = Derived(paths.derived_db)
+        self.oracle = Oracle(self.reg)
+        cur_file = paths.state / "session"
+        if session_id is None and not new_session and cur_file.exists():
+            session_id = cur_file.read_text().strip() or None
+        if session_id is None or self.reg.session(session_id) is None:
+            snap = self.blobs.put_text(self.text())
+            session_id = self.reg.start_session("tui", snap)
+            cur_file.write_text(session_id)
+        self.session_id = session_id
+        self.gateway = Gateway(self.reg, self.blobs, session_id, self.lobby_ids)
+        exa = ExaClient(max_chars=self.cfg["exa_max_chars"])
+        fns = make_tools(exa, self.rag, self.derived, self.cfg["exa_num_results"])
+        self.gateway.register(ToolSpec("search", "retrieval", "unified", fns["search"]))
+        self.gateway.register(ToolSpec("exa.search", "retrieval", "exa", fns["exa.search"]))
+        self.gateway.register(ToolSpec("exa.fetch", "retrieval", "exa", fns["exa.fetch"]))
+        self.gateway.register(ToolSpec("lobby.search", "internal", "lobby", fns["lobby.search"]))
+        self.rebuild()
+
+    @classmethod
+    def open(cls, root: Path, **kw) -> "Hotel":
+        return cls(Paths(root), **kw)
+
+    # ------------------------------------------------------------- lobby io
+    def text(self) -> str:
+        return self.paths.lobby.read_text(encoding="utf-8")
+
+    def lobby(self):
+        return parse(self.text())
+
+    def lobby_ids(self) -> set[str]:
+        try:
+            return set(self.lobby().entries)
+        except Exception:
+            return set()
+
+    def rebuild(self) -> list[str]:
+        _, errs = validate_text(self.text(), self.oracle)
+        if errs:
+            return errs
+        self.derived.rebuild(self.text(), self.paths.directory)
+        return []
+
+    def head_text(self) -> str | None:
+        r = git(self.paths.root, "show", "HEAD:lobby.txt")
+        return r.stdout if r.returncode == 0 else None
+
+    def check(self) -> list[str]:
+        """Validate working-tree lobby against git HEAD (catches bad hand edits)."""
+        head = self.head_text()
+        cur = self.text()
+        if head is None:
+            return validate_text(cur, self.oracle)[1]
+        return validate_transition(head, cur, self.oracle) if head != cur else validate_text(cur, self.oracle)[1]
+
+    def sync_hand_edits(self) -> list[str]:
+        """If the user edited lobby.txt by hand, validate and commit it as a user edit."""
+        head = self.head_text()
+        cur = self.text()
+        if head is None or head == cur:
+            return []
+        errs = validate_transition(head, cur, self.oracle)
+        if errs:
+            return errs
+        git(self.paths.root, "add", "lobby.txt")
+        commit = _commit(self.paths.root, "hotel: hand edit (user)")
+        self.gateway.log("lobby_edit", "user", payload={
+            "ops": [], "hand_edit": True, "origin": "user",
+            "before": self.blobs.put_text(head), "after": self.blobs.put_text(cur), "commit": commit,
+        })
+        self.rebuild()
+        return []
+
+    # ------------------------------------------------------------- apply
+    def apply(self, ops: list, *, actor: str = "user", origin: str = "user",
+              cause: int | None = None) -> ApplyResult:
+        old = self.text()
+        ts = utcnow()
+        text, created, touched, op_ids = old, [], [], []
+        promotes: list[tuple[int, PromoteOp]] = []
+        for op in ops:
+            rag_id = None
+            if isinstance(op, PromoteOp):
+                rag_id = self.rag.next_id() + len(promotes)
+            res = apply_op(text, op, origin=origin, ts=ts, rag_id=rag_id)
+            if res.noop:
+                op_ids.append([])
+                continue
+            text = res.text
+            created += res.created
+            touched += res.touched
+            op_ids.append(res.created)
+            if rag_id is not None:
+                promotes.append((rag_id, op))
+        if text == old:
+            raise OpError("no change")
+        errs = validate_transition(old, text, self.oracle)
+        if errs:
+            raise ValidationFailed(errs)
+        self.paths.lobby.write_text(text, encoding="utf-8", newline="\n")
+        for rag_id, op in promotes:
+            self.rag.add("promotion", "lobby-librarian", f"promoted {op.id}", op.text, doc_id=rag_id)
+        git(self.paths.root, "add", "lobby.txt")
+        summary = ", ".join(f"{o.op} {getattr(o, 'id', getattr(o, 'room', ''))}" for o in ops)
+        commit = _commit(self.paths.root, f"lobby[{actor}/{origin}]: {summary}")
+        entry = self.gateway.log("lobby_edit", actor, ref_id=cause, payload={
+            "ops": [op_dump(o) for o in ops], "created": op_ids, "origin": origin, "ts": ts,
+            "before": self.blobs.put_text(old), "after": self.blobs.put_text(text), "commit": commit,
+            "promoted": [r for r, _ in promotes],
+        })
+        self.rebuild()
+        return ApplyResult(created, touched, commit, entry.id)
+
+    # ------------------------------------------------------------- residents
+    def close_is_deterministic(self, op: CloseOp) -> tuple[bool, str]:
+        lob = self.lobby()
+        e = lob.entries.get(op.id)
+        if not e or e.sigil not in (" ", "!"):
+            return False, f"{op.id} is not open"
+        if not op.closed_by.startswith("R:"):
+            return False, "closed_by must be a Reg retrieval"
+        rid = int(op.closed_by[2:])
+        ann = self.reg.annotation_for(rid)
+        if not ann:
+            return False, f"{op.closed_by} is not annotated"
+        for c in ann.payload["claims"]:
+            if c["relation"] == "supports" and op.id in c["lobby_refs"]:
+                return True, f"annotation of {op.closed_by} has a supporting claim on {op.id}"
+        return False, f"no supporting claim on {op.id} in annotation of {op.closed_by}"
+
+    def route_resident_op(self, op, actor: str, cause: int | None) -> RouteResult:
+        since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if self.reg.count_recent("lobby_edit", actor, since) >= self.cfg["resident_rate_cap_per_hour"]:
+            return RouteResult(op, "rejected", "rate cap reached")
+        if isinstance(op, AppendOp) and op.type != "log":
+            return RouteResult(op, "rejected", f"residents never author new {op.type} entries")
+        meaning_changing = isinstance(op, (SupersedeOp, ContestOp, ReopenOp, PromoteOp))
+        if isinstance(op, CloseOp):
+            ok, why = self.close_is_deterministic(op)
+            meaning_changing, reason = (not ok), why
+        else:
+            reason = "meaning-changing: needs review" if meaning_changing else "structural"
+        if meaning_changing:
+            r = self.gateway.log("review", actor, ref_id=cause, payload={"op": op_dump(op), "reason": reason})
+            return RouteResult(op, "queued", reason, f"review R:{r.id}")
+        try:
+            res = self.apply([op], actor=actor, origin="resident", cause=cause)
+        except OpError as ex:
+            return RouteResult(op, "noop", str(ex))
+        except ValidationFailed as ex:
+            return RouteResult(op, "rejected", "validator: " + "; ".join(ex.errors[:3]))
+        return RouteResult(op, "applied", reason, f"commit {res.commit[:8] if res.commit else '-'}")
+
+    def decide(self, review_id: int, approve: bool, actor: str = "user") -> RouteResult:
+        rv = self.reg.get(review_id)
+        if not rv or rv.kind != "review":
+            raise ValueError(f"R:{review_id} is not a review item")
+        if review_id not in {p.id for p in self.reg.pending_reviews()}:
+            raise ValueError(f"R:{review_id} already decided")
+        op = op_load(rv.payload["op"])
+        if not approve:
+            self.gateway.log("decision", actor, ref_id=review_id, payload={"verdict": "reject"})
+            return RouteResult(op, "rejected", "rejected by user")
+        try:
+            res = self.apply([op], actor=actor, origin="approved", cause=review_id)
+        except (OpError, ValidationFailed) as ex:
+            self.gateway.log("decision", actor, ref_id=review_id, payload={"verdict": "approve-failed", "error": str(ex)})
+            return RouteResult(op, "rejected", f"approved but failed to apply: {ex}")
+        self.gateway.log("decision", actor, ref_id=review_id, payload={"verdict": "approve", "lobby_edit": res.reg_id})
+        return RouteResult(op, "applied", "approved", f"commit {res.commit[:8] if res.commit else '-'}")

@@ -6,6 +6,8 @@ a result from the web, you must annotate it with a quote before you can use it.
 
 You need Python 3.12 or later and `git`.
 
+New to Hotel? Start with the [tutorial](TUTORIAL.md). It walks through one full session in about 15 minutes.
+
 ## Contents
 
 - [Concepts](#concepts)
@@ -252,6 +254,10 @@ hash-addressed bytes are removed. It does not cover:
 - lobby text, which is in git history (use `git filter-repo`)
 - rows written before v0.2, which stored arguments and annotations inline
 - existing backups (prune them)
+- the sha256 of each deleted blob, which stays in the row. Anyone with the Reg can confirm a guess at short,
+  predictable content such as a search query by hashing it.
+
+Forgetting an unannotated retrieval also releases the annotation gate for it.
 
 Model providers: the model router has a guard that requires you to confirm the Mercury training opt-out.
 

@@ -62,22 +62,31 @@ def build_server(hotel) -> MCPServer:
         except GateBlocked as ex:
             raise ToolError(f"{ex}. Call annotate on it now.") from None
 
+    def read(what: str, **args) -> None:
+        """Gate and log a lobby read: every client call is a Reg row."""
+        gate(what)
+        gw.log("internal", "mcp", tool=f"mcp.{what}", provider="lobby", payload=gw._args_payload(args))
+
     def directory() -> str:
         p = hotel.paths.directory
         return p.read_text(encoding="utf-8") if p.exists() else "(empty)"
 
     @mcp.resource("hotel://lobby", mime_type="text/plain", description="The full lobby text.")
     def lobby_text() -> str:
-        return hotel.text()
+        with lock:
+            read("resource:lobby")
+            return hotel.text()
 
     @mcp.resource("hotel://directory", mime_type="text/plain", description="Open lobby entries by room.")
     def lobby_directory_resource() -> str:
-        return directory()
+        with lock:
+            read("resource:directory")
+            return directory()
 
     @mcp.tool(description="Open lobby entries grouped by room. Start here.")
     def lobby_directory() -> str:
         with lock:
-            gate("lobby_directory")
+            read("lobby_directory")
             return directory()
 
     @mcp.tool(description="Full-text search over the user's lobby (their own notes, not external evidence).")
@@ -92,7 +101,7 @@ def build_server(hotel) -> MCPServer:
     @mcp.tool(description="Read lobby entries by id (e.g. ['L0007']), with their metadata lines.")
     def read_entries(ids: list[str]) -> str:
         with lock:
-            gate("read_entries")
+            read("read_entries", ids=ids)
             lob = hotel.lobby()
             blocks = ["\n".join(lob.lines[e.start:e.end + 1]) for i in ids if (e := lob.entries.get(i))]
             return "\n\n".join(blocks) or "no such entries"
@@ -168,10 +177,11 @@ def build_server(hotel) -> MCPServer:
 
     @mcp.tool(description="Drafts waiting for the user's decision (from any agent).")
     def review_queue() -> str:
-        with lock:
-            rows = hotel.reg.pending_reviews()
-            return "\n".join(f"{r.rid} [{r.actor}] {r.payload.get('reason', '')}: {r.payload.get('op')}"
-                             for r in rows) or "(empty)"
+        # Ungated and read-only, so it skips the lock: a long deep_research call must not hold it up.
+        gw.log("internal", "mcp", tool="mcp.review_queue", provider="reg")
+        rows = hotel.reg.pending_reviews()
+        return "\n".join(f"{r.rid} [{r.actor}] {r.payload.get('reason', '')}: {r.payload.get('op')}"
+                         for r in rows) or "(empty)"
 
     return mcp
 

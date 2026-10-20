@@ -89,11 +89,12 @@ def _read() -> dict[str, str]:
 def _write(d: dict[str, str]) -> None:
     KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = KEYS_FILE.with_name(KEYS_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
-    try:
-        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)  # no-op semantics on Windows, which uses the profile ACL
-    except OSError:
-        pass
+    tmp.unlink(missing_ok=True)  # O_CREAT's mode only applies to a new file
+    # Created 0600 from the start, so the keys are never readable by others, not even briefly.
+    # Windows ignores the mode and relies on the profile ACL.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(d, indent=2) + "\n")
     os.replace(tmp, KEYS_FILE)
 
 

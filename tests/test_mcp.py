@@ -67,6 +67,12 @@ def test_gate_annotation_and_drafts_through_mcp(hotel):
                 {"op": "append", "room": "exa", "type": "idea", "body": "Use startPublishedDate.",
                  "refs": [f"R:{rid}"], "tags": []}])
             assert err and "already queued" in again
+
+            # reads are Reg rows too, resources included
+            await c.read_resource("hotel://lobby")
+            await call("read_entries", ids=[bounty])
+            tools = {r.tool for r in hotel.reg.list(session_id=hotel.session_id, kind="internal")}
+            assert {"mcp.resource:lobby", "mcp.read_entries"} <= tools
             return int(out.rsplit("R:", 1)[1])
 
     review = anyio.run(run)

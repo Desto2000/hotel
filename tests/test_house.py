@@ -101,6 +101,13 @@ def test_forget_removes_content_keeps_chain(hotel):
     assert any(r.kind == "redaction" for r in hotel.reg.list())
 
 
+def test_forgetting_unannotated_retrieval_releases_gate(hotel):
+    e, _ = hotel.gateway.call("fake.search", actor="user", query="something private")
+    hotel.forget(e.id, reason="pasted a secret")
+    e2, _ = hotel.gateway.call("fake.search", actor="user", query="next")  # would raise GateBlocked
+    assert [p.id for p in hotel.gateway.pending()] == [e2.id]
+
+
 def test_move_and_review_for_residents(hotel):
     a = add(hotel, "harness", "idea", "embeddings belong elsewhere")
     hotel.apply([AppendOp(op="append", room="harness", type="log", body="x", refs=[a], tags=[])])

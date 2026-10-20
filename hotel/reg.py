@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -114,6 +115,9 @@ class Reg:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.conn = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+        # One connection shared by TUI worker threads: a transaction belongs to the
+        # connection, so appends from two threads must not interleave.
+        self._lock = threading.Lock()
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
@@ -152,29 +156,30 @@ class Reg:
         ts: str | None = None,
     ) -> RegEntry:
         c = self.conn
-        c.execute("BEGIN IMMEDIATE")
-        try:
-            seq = c.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM reg WHERE session_id=?", (session_id,)
-            ).fetchone()[0]
-            last = c.execute("SELECT entry_hash FROM reg ORDER BY id DESC LIMIT 1").fetchone()
-            fields = dict(
-                session_id=session_id, seq=seq, ts=ts or utcnow(), kind=kind, actor=actor,
-                tool=tool, provider=provider,
-                payload=json.dumps(payload, sort_keys=True, ensure_ascii=False) if payload is not None else None,
-                ref_id=ref_id, result_hash=result_hash, text_hash=text_hash, status=status,
-                error=error, prev_hash=last[0] if last else GENESIS,
-            )
-            fields["entry_hash"] = _hash_row(fields)
-            cols = ",".join(fields)
-            cur = c.execute(
-                f"INSERT INTO reg({cols}) VALUES ({','.join('?' * len(fields))})", tuple(fields.values())
-            )
-            rid = cur.lastrowid
-            c.execute("COMMIT")
-        except Exception:
-            c.execute("ROLLBACK")
-            raise
+        with self._lock:
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                seq = c.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM reg WHERE session_id=?", (session_id,)
+                ).fetchone()[0]
+                last = c.execute("SELECT entry_hash FROM reg ORDER BY id DESC LIMIT 1").fetchone()
+                fields = dict(
+                    session_id=session_id, seq=seq, ts=ts or utcnow(), kind=kind, actor=actor,
+                    tool=tool, provider=provider,
+                    payload=json.dumps(payload, sort_keys=True, ensure_ascii=False) if payload is not None else None,
+                    ref_id=ref_id, result_hash=result_hash, text_hash=text_hash, status=status,
+                    error=error, prev_hash=last[0] if last else GENESIS,
+                )
+                fields["entry_hash"] = _hash_row(fields)
+                cols = ",".join(fields)
+                cur = c.execute(
+                    f"INSERT INTO reg({cols}) VALUES ({','.join('?' * len(fields))})", tuple(fields.values())
+                )
+                rid = cur.lastrowid
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
         return self.get(rid)
 
     # ------------------------------------------------------------- read
@@ -207,10 +212,12 @@ class Reg:
         return RegEntry.from_row(r) if r else None
 
     def unannotated_retrievals(self) -> list[RegEntry]:
-        """Global, not per-session: starting a new session must not escape the gate."""
+        """Global, not per-session: starting a new session must not escape the gate.
+        A forgotten retrieval cannot be annotated any more, so it no longer holds the gate."""
         rows = self.conn.execute(
             """SELECT * FROM reg r WHERE r.kind='retrieval' AND r.status='ok'
                AND NOT EXISTS (SELECT 1 FROM reg a WHERE a.kind='annotation' AND a.status='ok' AND a.ref_id=r.id)
+               AND NOT EXISTS (SELECT 1 FROM reg x WHERE x.kind='redaction' AND x.ref_id=r.id)
                ORDER BY r.id"""
         )
         return [RegEntry.from_row(r) for r in rows]

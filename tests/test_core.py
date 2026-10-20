@@ -49,6 +49,28 @@ def test_reg_is_append_only_and_chained(hotel):
     assert hotel.reg.verify_chain() == []
 
 
+def test_reg_appends_from_threads_share_one_connection(hotel):
+    """The TUI's worker threads and its main thread append through the same Reg."""
+    import threading
+    errors = []
+
+    def writer():
+        try:
+            for _ in range(100):
+                hotel.reg.append(hotel.session_id, "internal", "t")
+        except Exception as ex:
+            errors.append(ex)
+
+    threads = [threading.Thread(target=writer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert len(hotel.reg.list(session_id=hotel.session_id, kind="internal", limit=1000)) == 400
+    assert hotel.reg.verify_chain() == []
+
+
 def test_gate_blocks_until_annotated(hotel, tmp_path):
     b = add(hotel, "harness", "bounty", "Does Exa support a date filter?")
     e1, _ = hotel.gateway.call("fake.search", query="exa date")

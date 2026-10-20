@@ -32,7 +32,7 @@ from .models import (
     Annotation, AppendOp, Claim, CloseOp, ContestOp, LinkOp, MoveOp, PromoteOp, RefOp, ReopenOp, SupersedeOp, TagOp,
 )
 from .ops import OpError
-from .render import highlight_lobby
+from .render import BUILDING, WINDOWS, building, highlight_lobby
 from .theme import lobby_styles, palettes, textual_theme
 
 TYPE_CMDS = {"bounty": "bounty", "goal": "goal", "idea": "idea", "reason": "reasoning",
@@ -53,20 +53,6 @@ HELP = r"""[b]write[/b]   plain text → monologue in current room · /bounty /g
 
 
 # ======================================================================== opening
-BUILDING = [  # "#" = a window, "=" = the sign's neon; the last row is the street
-    "      ┌───────────┐      ",
-    "      │ ========= │      ",
-    "    ┌─┴───────────┴─┐    ",
-    "    │ # # # # # # # │    ",
-    "    │ # # # # # # # │    ",
-    "    │ # # # # # # # │    ",
-    "    │ # # # # # # # │    ",
-    "    │ # # # # # # # │    ",
-    "    │ # # # ┌─┐ # # │    ",
-    "────┴───────┴─┴─────┴────",
-]
-
-
 class Building(Static):
     """The hotel: the street draws out, it rises floor by floor, the windows light up,
     the sign flickers on. Colours follow the app's current theme."""
@@ -74,7 +60,7 @@ class Building(Static):
     def __init__(self, on_done=None, **kw):
         super().__init__(**kw)
         self.on_done = on_done
-        wins = [(r, c) for r, row in enumerate(BUILDING) for c, ch in enumerate(row) if ch == "#"]
+        wins = list(WINDOWS)
         random.shuffle(wins)
         street = len(BUILDING) - 1
         half = (len(BUILDING[-1]) + 1) // 2
@@ -110,24 +96,7 @@ class Building(Static):
         self.update(self._frame(*self.frames[self.i]))
 
     def _frame(self, top: int, street_k: int, lit: set, sign: bool) -> Text:
-        st, t = self.app.st, Text()
-        street = len(BUILDING) - 1
-        mid = len(BUILDING[-1]) // 2
-        for r, row in enumerate(BUILDING):
-            for c, ch in enumerate(row):
-                if r == street:
-                    t.append(("─" if top == street else ch) if abs(c - mid) < street_k else " ", st["muted"])
-                elif r < top:
-                    t.append(" ")
-                elif ch == "#":
-                    t.append("■", st["warning"] if (r, c) in lit else st["dead"])
-                elif ch == "=":
-                    t.append("▬", st["room_name"] if sign else st["dead"])
-                else:
-                    t.append(ch, st["muted"])
-            t.append("\n")
-        t.rstrip()
-        return t
+        return building(self.app.st, top, street_k, lit, sign)
 
 
 class OpeningScreen(Screen):
@@ -793,13 +762,20 @@ class HotelApp(App):
         ev.input.value = ""
         if not line:
             return
+        # the command name only: arguments are queries and lobby text, which belong in blobs
+        name = "/" + line[1:].partition(" ")[0] if line.startswith("/") else (
+            "talk" if self.guest_mode and line.startswith(">") else "monologue")
+        events = self.hotel.events
+        events.emit("command", name=name, room=self.room)
         try:
             self.dispatch(line)
         except GateBlocked as ex:
             self.say(f"⛔ {ex}", "error")
         except ValidationFailed as ex:
+            events.emit("rejected", name=name, error="; ".join(ex.errors[:3])[:300])
             self.say("validator rejected:\n" + "\n".join(ex.errors[:6]), "error")
         except (OpError, ValueError) as ex:
+            events.emit("rejected", name=name, error=str(ex)[:300])
             self.say(str(ex), "error")
         self.refresh_all()
 
@@ -1015,6 +991,7 @@ class HotelApp(App):
                 self.guest = Guest(h, on_event=lambda s: self.call_from_thread(self.say, f"guest · {s}"))
             turn = self.guest.say(text, note_id)
         except Exception as ex:
+            h.events.emit("error", where="guest", error=f"{type(ex).__name__}: {ex}"[:300])
             self.call_from_thread(self.say, f"guest failed (logged): {ex}", "error")
             self.call_from_thread(self.refresh_all)
             return
@@ -1053,6 +1030,7 @@ class HotelApp(App):
                 if h.reg.annotation_for(rid):
                     run_librarian(h, rid)
         except Exception as ex:
+            h.events.emit("error", where="research", error=f"{type(ex).__name__}: {ex}"[:300])
             self.call_from_thread(self.say, f"research failed (logged): {ex}", "error")
             self.call_from_thread(self.refresh_all)
             return
@@ -1089,6 +1067,7 @@ class HotelApp(App):
         try:
             out, results = run_librarian(h, rid)
         except Exception as ex:
+            h.events.emit("error", where="librarian", error=f"{type(ex).__name__}: {ex}"[:300])
             self.call_from_thread(self.say, f"librarian failed (logged if a model call): {ex}", "error")
             self.call_from_thread(self.refresh_all)
             return

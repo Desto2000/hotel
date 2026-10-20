@@ -71,6 +71,21 @@ def test_reg_appends_from_threads_share_one_connection(hotel):
     assert hotel.reg.verify_chain() == []
 
 
+def test_event_log_mirrors_every_reg_row_without_content(hotel):
+    """The timeline gets every row, but queries, results and lobby text stay in forgettable blobs."""
+    import json
+    add(hotel, "inbox", "bounty", "Body words zebrafinch?")
+    hotel.gateway.call("fake.search", query="query words quokka")
+    with pytest.raises(GateBlocked):
+        hotel.gateway.call("fake.search", query="second query axolotl")
+    raw = hotel.paths.log.read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in raw.splitlines() if '"event": "reg"' in line]
+    assert [(r["id"], r["kind"]) for r in rows] == [(e.id, e.kind) for e in hotel.reg.list()]
+    assert rows[-1]["pending"] == [rows[-2]["id"]]
+    for word in ("zebrafinch", "quokka", "axolotl", "startPublishedDate"):
+        assert word not in raw
+
+
 def test_gate_blocks_until_annotated(hotel, tmp_path):
     b = add(hotel, "harness", "bounty", "Does Exa support a date filter?")
     e1, _ = hotel.gateway.call("fake.search", query="exa date")

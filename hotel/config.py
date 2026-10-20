@@ -8,6 +8,7 @@
   .hotel/derived.sqlite  FTS index over the lobby (derived, rebuildable)
   .hotel/rag.sqlite      imported / promoted knowledge
   .hotel/config.json     local settings
+  .hotel/hotel.log       event timeline (JSON lines; `hotel log` follows it)
 """
 
 from __future__ import annotations
@@ -57,6 +58,10 @@ class Paths:
     @property
     def config(self) -> Path:
         return self.state / "config.json"
+
+    @property
+    def log(self) -> Path:
+        return self.state / "hotel.log"
 
 
 DEFAULT_CONFIG = {

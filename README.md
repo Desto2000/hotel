@@ -112,7 +112,7 @@ UI roles map to Zed keys, and lobby syntax maps to Zed syntax scopes.
 hotel add | search | annotate <json> | lib <rid> | research <L> | guest "<msg>" [--note]
       | accept <rid> | move <L> <room> | custodian | backup [dir] | restore <src> <dst>
       | forget <rid> --reason | home [dir] | setup | keys list|set|rm | doctor | version
-      | timings | render | snapshot | review list|approve|reject | check | verify | rebuild
+      | timings | log | render | snapshot | review list|approve|reject | check | verify | rebuild
       | reg | replay <session> | rag-import | sessions | schema
       | mcp [--http --host --port --token]
 ```
@@ -123,6 +123,7 @@ hotel add | search | annotate <json> | lib <rid> | research <L> | guest "<msg>" 
 hotel render --plain | --directory                  # lobby as text
 hotel snapshot --cmd "/bounty x?" --svg out.svg     # headless TUI state as text (+ SVG)
 hotel timings                                       # model vs. tool latency per agent run
+hotel log [-n 50] [--no-follow]                     # live timeline of every process (TUI, MCP, CLI)
 hotel replay <session> --librarian rule             # re-run a session with another librarian, diff
 ```
 

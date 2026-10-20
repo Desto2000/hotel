@@ -15,6 +15,7 @@ from pathlib import Path
 from .blobs import BlobStore
 from .config import Paths, load_config, save_config, DEFAULT_CONFIG
 from .derived import Derived
+from .events import EventLog
 from .gateway import Gateway, ToolSpec, load_annotation
 from .grammar import empty_lobby, parse
 from .locking import atomic_write_text, file_lock
@@ -96,11 +97,12 @@ class RouteResult:
 
 class Hotel:
     def __init__(self, paths: Paths, session_id: str | None = None, new_session: bool = False,
-                 label: str = "tui"):
+                 label: str = "tui", source: str | None = None):
         self.paths = paths
         self.cfg = load_config(paths)
         self.blobs = BlobStore(paths.blobs)
-        self.reg = Reg(paths.reg_db)
+        self.events = EventLog(paths.log, source or label)
+        self.reg = Reg(paths.reg_db, self.events)
         self.rag = Rag(paths.rag_db)
         self.derived = Derived(paths.derived_db)
         self.oracle = Oracle(self.reg)

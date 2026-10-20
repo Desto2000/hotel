@@ -112,8 +112,9 @@ def _hash_row(fields: dict) -> str:
 
 
 class Reg:
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, events=None):
         self.db_path = db_path
+        self.events = events  # EventLog mirror for the live timeline (None: replay / tests)
         self.conn = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
         # One connection shared by TUI worker threads: a transaction belongs to the
         # connection, so appends from two threads must not interleave.
@@ -129,6 +130,8 @@ class Reg:
             "INSERT INTO sessions(id, started_at, label, lobby_snapshot) VALUES (?,?,?,?)",
             (sid, utcnow(), label, lobby_snapshot),
         )
+        if self.events:
+            self.events.emit("session", id=sid, label=label)
         return sid
 
     def session(self, sid: str) -> dict | None:
@@ -180,7 +183,10 @@ class Reg:
             except Exception:
                 c.execute("ROLLBACK")
                 raise
-        return self.get(rid)
+        entry = self.get(rid)
+        if self.events:
+            self.events.reg_row(entry)
+        return entry
 
     # ------------------------------------------------------------- read
     def get(self, rid: int) -> RegEntry | None:

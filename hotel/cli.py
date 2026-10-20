@@ -10,14 +10,29 @@ from pathlib import Path
 
 from . import keys
 from .config import Paths, find_root
+from .events import EventLog
 
 
-def _hotel(args, **kw):
-    from .core import Hotel
+_run: dict = {}  # the process's EventLog and start time, for the exit event
+
+
+def _home(args) -> Paths:
     root = Path(args.home).resolve() if args.home else find_root()
     if root is None or not (root / ".hotel").is_dir():
         sys.exit("no hotel home found — run `hotel init <dir>`, `hotel home <dir>`, or set HOTEL_HOME")
-    return Hotel(Paths(root), **kw)
+    return Paths(root)
+
+
+def _hotel(args, **kw):
+    import time
+
+    from .core import Hotel
+    paths = _home(args)
+    cmd = args.cmd or "tui"
+    events = EventLog(paths.log, cmd)
+    events.emit("start", cmd=cmd)  # before Hotel(): opening can start a session, which should follow
+    _run.update(events=events, t0=time.monotonic())
+    return Hotel(paths, source=cmd, **kw)
 
 
 def doctor(args) -> int:
@@ -104,6 +119,26 @@ def keys_cmd(args) -> int:
 
 
 def main(argv=None):
+    """Run a command; if it opened a hotel, log how the process ended."""
+    import time
+    code, error = 0, None
+    try:
+        return _main(argv)
+    except SystemExit as ex:
+        code = ex.code if isinstance(ex.code, int) else (1 if ex.code else 0)
+        raise
+    except KeyboardInterrupt:
+        code = 130
+        raise
+    except BaseException as ex:
+        code, error = 1, f"{type(ex).__name__}: {ex}"[:500]
+        raise
+    finally:
+        if ev := _run.pop("events", None):
+            ev.emit("exit", code=code or None, error=error, seconds=round(time.monotonic() - _run["t0"], 1))
+
+
+def _main(argv=None):
     p = argparse.ArgumentParser(prog="hotel")
     p.add_argument("--home", help="hotel home directory (default: HOTEL_HOME or nearest .hotel)")
     sub = p.add_subparsers(dest="cmd")
@@ -127,6 +162,9 @@ def main(argv=None):
     s = sub.add_parser("accept", help="keep an agent output as an approved lobby entry"); s.add_argument("reg_id", type=int)
     s.add_argument("--room")
     s = sub.add_parser("timings", help="model vs tool latency per agent run"); s.add_argument("--last", type=int, default=5)
+    s = sub.add_parser("log", help="timeline of everything every hotel process did; follows live")
+    s.add_argument("-n", "--last", type=int, default=50, help="past events to show first (default 50)")
+    s.add_argument("--no-follow", action="store_true", help="print and exit instead of following")
     s = sub.add_parser("render", help="print the lobby (highlighted, or --plain / --directory)")
     s.add_argument("--plain", action="store_true"); s.add_argument("--directory", action="store_true")
     s = sub.add_parser("snapshot", help="run the TUI headless with scripted commands; dump text (+ svg)")
@@ -199,6 +237,14 @@ def main(argv=None):
                 keys.onboard(home=paths)
         elif left:
             print("API keys missing: " + ", ".join(p.env for p in left) + " — run `hotel setup`")
+        return
+    if a.cmd == "log":
+        from .config import load_config
+        from .events import show
+        from .theme import lobby_styles, palettes
+        paths = _home(a)
+        pal = palettes().get(load_config(paths).get("theme"), palettes()["calculus-dark"])
+        show(paths, lobby_styles(pal), last=a.last, follow=not a.no_follow)
         return
     if a.cmd == "schema":
         from .models import LibrarianOutput

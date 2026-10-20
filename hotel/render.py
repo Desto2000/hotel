@@ -6,6 +6,47 @@ from rich.text import Text
 
 from .grammar import BODY_RE, ENTRY_RE, HEADER, META_RE, ROOM_RE
 
+BUILDING = [  # "#" = a window, "=" = the sign's neon; the last row is the street
+    "      ┌───────────┐      ",
+    "      │ ========= │      ",
+    "    ┌─┴───────────┴─┐    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # ┌─┐ # # │    ",
+    "────┴───────┴─┴─────┴────",
+]
+WINDOWS = [(r, c) for r, row in enumerate(BUILDING) for c, ch in enumerate(row) if ch == "#"]
+
+
+def building(st: dict, top: int = 0, street_k: int = len(BUILDING[-1]), lit: set | None = None,
+             sign: bool = True) -> Text:
+    """One frame of the hotel (the TUI's opening animation; `hotel log`'s banner).
+    Rows above `top` are not built yet; the street is drawn `street_k` cells either side
+    of the middle; `lit` windows glow (None: all of them)."""
+    t = Text()
+    street = len(BUILDING) - 1
+    mid = len(BUILDING[-1]) // 2
+    lit = set(WINDOWS) if lit is None else lit
+    for r, row in enumerate(BUILDING):
+        for c, ch in enumerate(row):
+            if r == street:
+                t.append(("─" if top == street else ch) if abs(c - mid) < street_k else " ", st["muted"])
+            elif r < top:
+                t.append(" ")
+            elif ch == "#":
+                t.append("■", st["warning"] if (r, c) in lit else st["dead"])
+            elif ch == "=":
+                t.append("▬", st["room_name"] if sign else st["dead"])
+            else:
+                t.append(ch, st["muted"])
+        t.append("\n")
+    t.rstrip()
+    return t
+
+
 SIG_STYLE = {" ": "sig_open", "x": "sig_closed", "~": "sig_superseded", "!": "sig_contested", ".": "sig_static"}
 
 

@@ -134,6 +134,24 @@ def missing_required() -> list[Provider]:
     return [p for p in PROVIDERS if p.required and source(p.env) is None]
 
 
+def onboarded() -> bool:
+    """True once setup ran (CLI wizard or the TUI's first-run screen)."""
+    return KEYS_FILE.with_name("onboarded").exists()
+
+
+def mark_onboarded() -> None:
+    KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KEYS_FILE.with_name("onboarded").touch()
+
+
+def confirm_optout(home) -> None:
+    """Record in the home config that the Mercury training opt-out is off in the dashboard."""
+    from .config import load_config, save_config
+    saved = json.loads(home.config.read_text(encoding="utf-8")) if home.config.exists() else dict(load_config(home))
+    saved["inception_training_opt_out_confirmed"] = True
+    save_config(home, saved)
+
+
 # ------------------------------------------------------------------ wizard
 def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[str], str] = getpass.getpass,
             out: Callable[[str], None] = print, check: bool = True, only: list[str] | None = None,
@@ -175,6 +193,7 @@ def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[s
             break
     if home is not None and (only is None or "INCEPTION_API_KEY" in only):
         _optout_step(home, ask, out)
+    mark_onboarded()
     left = missing_required()
     if left:
         out("still missing (required): " + ", ".join(p.env for p in left) + " — rerun `hotel setup` any time")
@@ -184,7 +203,7 @@ def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[s
 
 
 def _optout_step(home, ask, out) -> None:
-    from .config import load_config, save_config
+    from .config import load_config
     cfg = load_config(home)
     if cfg.get("inception_training_opt_out_confirmed"):
         return
@@ -192,9 +211,7 @@ def _optout_step(home, ask, out) -> None:
     out("hotel refuses to send lobby content to it until you confirm you have done that.")
     ans = ask("  have you turned the training opt-in OFF in the dashboard? [y/N] ").strip().lower()
     if ans in ("y", "yes"):
-        saved = json.loads(home.config.read_text(encoding="utf-8")) if home.config.exists() else dict(cfg)
-        saved["inception_training_opt_out_confirmed"] = True
-        save_config(home, saved)
+        confirm_optout(home)
         out("  recorded in .hotel/config.json\n")
     else:
         out("  not confirmed — model features stay blocked until you do (rerun `hotel setup`)\n")

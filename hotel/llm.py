@@ -24,7 +24,7 @@ from .gateway import ToolResult, ToolSpec
 DEFAULT_PROFILES = {
     "mercury": {
         "base_url": "https://api.inceptionlabs.ai/v1",
-        "model": "mercury-2.5",
+        "model": "mercury-3",
         "key_env": "INCEPTION_API_KEY",
         # Inception's own vocabulary: instant | low | medium | high
         "effort": {"agent": "low", "librarian": "low"},

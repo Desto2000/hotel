@@ -42,3 +42,40 @@ def test_two_fast_guest_messages_both_answered(tmp_path):
     bodies = [e.text for e in h.lobby().entries.values()]
     assert bodies == ["thought one"]  # the '>' line was talk, not a note
     assert len(h.reg.list(kind="output")) == 2
+
+
+def test_onboarding_saves_only_accepted_keys_and_finishes(tmp_path, monkeypatch):
+    import httpx
+
+    from hotel import keys
+    from hotel.tui import OnboardingScreen
+    monkeypatch.setattr(keys, "KEYS_FILE", tmp_path / "cfg" / "keys.json")
+    for e in ("EXA_API_KEY", "MCP_EXA_API_KEY", "INCEPTION_API_KEY"):
+        monkeypatch.delenv(e, raising=False)
+    init_home(tmp_path / "home")
+    h = Hotel(Paths(tmp_path / "home"))
+    codes = iter([401, 200])
+    post = lambda *a, **k: httpx.Response(next(codes), request=httpx.Request("GET", "http://x"))
+
+    async def go():
+        app = HotelApp(h, splash=False, onboard=False)
+        async with app.run_test(size=(120, 44)) as pilot:
+            app.push_screen(OnboardingScreen(h, post=post))
+            await pilot.pause()
+            await pilot.press("enter")  # welcome -> Exa
+            for key in ("wrong-key", "right-key"):
+                await pilot.press(*key, "enter")
+                for _ in range(50):
+                    await pilot.pause(0.05)
+                    if not app.screen.busy:
+                        break
+                if key == "wrong-key":
+                    assert keys.get("EXA_API_KEY") is None and app.screen.step.env == "EXA_API_KEY"
+            assert app.screen.step.env == "INCEPTION_API_KEY"
+            await pilot.press("escape")
+            await pilot.pause()
+            return type(app.screen).__name__
+
+    assert asyncio.run(go()) == "Screen"
+    assert keys.get("EXA_API_KEY") == "right-key" and keys.source("INCEPTION_API_KEY") is None
+    assert keys.onboarded()

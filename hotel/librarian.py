@@ -2,7 +2,7 @@
 
 Swappable behind `Librarian.propose(ctx) -> LibrarianOutput`:
   RuleLibrarian     deterministic baseline, no network (also the replay control)
-  ModelLibrarian    any router profile (Mercury 2.5 default) with schema-constrained
+  ModelLibrarian    any router profile (Mercury 3 default) with schema-constrained
                     JSON; logged through the gateway as a `model` row.
 
 Ops never apply directly: they go through Hotel.route_resident_op (policy:
@@ -119,7 +119,7 @@ class RuleLibrarian:
 
 
 class ModelLibrarian:
-    """Any OpenAI-compatible model via the router (Mercury 2.5 by default).
+    """Any OpenAI-compatible model via the router (Mercury 3 by default).
     Output is schema-constrained JSON, then validated locally with Pydantic; one
     repair turn feeds the validation error back (feedback loop, not a crash)."""
 

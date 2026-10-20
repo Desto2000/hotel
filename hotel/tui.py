@@ -8,6 +8,7 @@ annotate them (ctrl+a).
 from __future__ import annotations
 
 import json
+import random
 import shlex
 import threading
 from pathlib import Path
@@ -16,12 +17,13 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.containers import Center, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button, DataTable, Footer, Input, Label, Select, Static, TabbedContent, TabPane, Tree,
 )
 
+from . import keys
 from .core import Hotel, ValidationFailed
 from .gateway import AnnotationRejected, GateBlocked, make_pointer
 from .grammar import SIGIL_NAMES
@@ -36,19 +38,355 @@ from .theme import lobby_styles, palettes, textual_theme
 TYPE_CMDS = {"bounty": "bounty", "goal": "goal", "idea": "idea", "reason": "reasoning",
              "log": "log", "mono": "monologue"}
 
-HELP = """[b]write[/b]   plain text → monologue in current room · /bounty /goal /idea /reason /log <text>
+HELP = r"""[b]write[/b]   plain text → monologue in current room · /bounty /goal /idea /reason /log <text>
 [b]rooms[/b]   /room <slug>
 [b]search[/b]  /s <q> unified (exa+rag+lobby) · /exa <q> · /fetch <url> · /ls <q> lobby only (ungated)
-[b]gate[/b]    /annotate [R:n] (ctrl+a) — required after every external retrieval
+[b]gate[/b]    /annotate \[R:n] (ctrl+a) — required after every external retrieval
 [b]edit[/b]    /close L R:n · /supersede L <text> · /contest L <why> · /reopen L <why>
         /tag L t · /link L L · /ref L R:n · /promote L
 [b]guest[/b]   /guest (on) · /guest new · /guest off — your lines become notes, the guest replies, drafts → Review
         in guest mode, start a line with > to talk without writing it down (e.g. "> yes, draft it") · /talk <msg>
 [b]agent[/b]   /research L#### (one bounty per run) · /accept R:n keep an answer as an approved entry
-[b]house[/b]   /move L <room> [why] · /custodian (flag stale closed bounties) · /backup [dir]
-[b]resident[/b] /lib [R:n] run librarian · /approve R:n · /reject R:n
-[b]inspect[/b] /blob R:n · /check · /verify · /theme (ctrl+t) · /q"""
+[b]house[/b]   /move L <room> \[why] · /custodian (flag stale closed bounties) · /backup \[dir]
+[b]resident[/b] /lib \[R:n] run librarian · /approve R:n · /reject R:n
+[b]inspect[/b] /blob R:n · /check · /verify · /theme (ctrl+t) · /setup (keys, privacy, theme) · /q"""
 
+
+# ======================================================================== opening
+BUILDING = [  # "#" = a window, "=" = the sign's neon; the last row is the street
+    "      ┌───────────┐      ",
+    "      │ ========= │      ",
+    "    ┌─┴───────────┴─┐    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # # # # # │    ",
+    "    │ # # # ┌─┐ # # │    ",
+    "────┴───────┴─┴─────┴────",
+]
+
+
+class Building(Static):
+    """The hotel: the street draws out, it rises floor by floor, the windows light up,
+    the sign flickers on. Colours follow the app's current theme."""
+
+    def __init__(self, on_done=None, **kw):
+        super().__init__(**kw)
+        self.on_done = on_done
+        wins = [(r, c) for r, row in enumerate(BUILDING) for c, ch in enumerate(row) if ch == "#"]
+        random.shuffle(wins)
+        street = len(BUILDING) - 1
+        half = (len(BUILDING[-1]) + 1) // 2
+        self.frames = [(street, k, set(), False) for k in range(1, half + 1, 2)]  # street draws out
+        self.frames += [(street - n, half, set(), False) for n in range(1, street + 1)]  # floors rise
+        for i in range(0, len(wins) + 1, 2):  # windows light up
+            self.frames.append((0, half, set(wins[:i]), False))
+        lit = set(wins[:-4])  # a few stay dark, like a real hotel at night
+        for on in (True, False, True, False, False, True, True, True, True, True, True):  # neon flicker, hold
+            self.frames.append((0, half, lit, on))
+        self.i = 0
+
+    def on_mount(self):
+        self.repaint()
+        self.timer = self.set_interval(0.06, self._step)
+
+    def _step(self):
+        if self.i + 1 >= len(self.frames):
+            self.timer.stop()
+            if self.on_done:
+                self.on_done()
+            return
+        self.i += 1
+        self.repaint()
+
+    def finish(self):
+        """Jump to the last frame (lit hotel, sign on)."""
+        self.timer.stop()
+        self.i = len(self.frames) - 1
+        self.repaint()
+
+    def repaint(self):
+        self.update(self._frame(*self.frames[self.i]))
+
+    def _frame(self, top: int, street_k: int, lit: set, sign: bool) -> Text:
+        st, t = self.app.st, Text()
+        street = len(BUILDING) - 1
+        mid = len(BUILDING[-1]) // 2
+        for r, row in enumerate(BUILDING):
+            for c, ch in enumerate(row):
+                if r == street:
+                    t.append(("─" if top == street else ch) if abs(c - mid) < street_k else " ", st["muted"])
+                elif r < top:
+                    t.append(" ")
+                elif ch == "#":
+                    t.append("■", st["warning"] if (r, c) in lit else st["dead"])
+                elif ch == "=":
+                    t.append("▬", st["room_name"] if sign else st["dead"])
+                else:
+                    t.append(ch, st["muted"])
+            t.append("\n")
+        t.rstrip()
+        return t
+
+
+class OpeningScreen(Screen):
+    """Startup animation. Ends by itself; any key skips (and is typed into the prompt)."""
+
+    CSS = "OpeningScreen { align: center middle; background: $background; } #opening { width: auto; }"
+
+    def compose(self) -> ComposeResult:
+        yield Building(on_done=lambda: self.dismiss(None), id="opening")
+
+    def on_key(self, event):
+        event.stop()
+        self.query_one(Building).timer.stop()
+        self.dismiss(event.character if event.is_printable else None)
+
+    def on_click(self):
+        self.query_one(Building).timer.stop()
+        self.dismiss(None)
+
+
+class OnboardingScreen(Screen):
+    """First-run setup, one step at a time: welcome, each API key (checked live against
+    the provider), the Mercury training opt-out, the theme (previewed live), ready.
+    Enter moves on; esc finishes later (`/setup` reopens it)."""
+
+    BINDINGS = [Binding("escape", "finish", "finish later", priority=True)]
+    CSS = """
+    OnboardingScreen { align: center middle; background: $background; }
+    #ob { width: 76; height: auto; }
+    #ob-art { width: auto; margin-bottom: 1; }
+    #ob-title, #ob-sub, #ob-steps { width: 100%; text-align: center; }
+    #ob-title { text-style: bold; color: $hotel-title; }
+    #ob-sub { color: $hotel-muted; }
+    #ob-steps { margin: 1 0; }
+    #ob-card { width: 100%; height: auto; min-height: 9; border: round $border; padding: 0 2;
+               border-title-color: $hotel-title; border-title-style: bold; }
+    #ob-body { height: auto; }
+    #ob-key { margin-top: 1; }
+    #ob-note { height: auto; }
+    #ob-hint { width: 100%; text-align: center; color: $hotel-muted; margin-top: 1; }
+    """
+
+    def __init__(self, hotel: Hotel, *, check: bool = True, post=None):
+        super().__init__()
+        self.hotel, self.check, self.post = hotel, check, post
+        self.steps: list = ["welcome", *keys.PROVIDERS]
+        if not hotel.cfg.get("inception_training_opt_out_confirmed"):
+            self.steps.append("privacy")
+        self.steps += ["theme", "ready"]
+        self.n = 0
+        self.note = Text()
+        self.busy = False
+
+    @property
+    def step(self):
+        return self.steps[self.n]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ob"):
+            with Center():
+                yield Building(id="ob-art")
+            yield Static("Welcome to hotel", id="ob-title")
+            yield Static("a logged, living lobby for what you learn", id="ob-sub")
+            yield Static(id="ob-steps")
+            with Vertical(id="ob-card"):
+                yield Static(id="ob-body")
+                yield Input(password=True, id="ob-key")
+                yield Static(id="ob-note")
+            yield Static(id="ob-hint")
+
+    def on_mount(self):
+        self.show()
+
+    # ------------------------------------------------------------- render
+    def show(self):
+        st, step = self.app.st, self.step
+        self.query_one("#ob-steps", Static).update(self._progress())
+        card = self.query_one("#ob-card")
+        body, hint = Text(), ""
+        inp = self.query_one("#ob-key", Input)
+        inp.display = False
+        if step == "welcome":
+            card.border_title = "welcome"
+            body.append("hotel replaces “chat with AI” as note-taking. Everything you and the\n", st["body"])
+            body.append("models do goes through a logged Reg; what lasts is one plain-text\n", st["body"])
+            body.append("document, the lobby.\n\n", st["body"])
+            body.append("Setup takes a minute: ", st["muted"])
+            body.append("API keys", st["type"])
+            body.append(", ", st["muted"])
+            body.append("privacy", st["type"])
+            body.append(", ", st["muted"])
+            body.append("theme", st["type"])
+            body.append(".", st["muted"])
+            hint = "enter  get started   ·   esc  later"
+        elif isinstance(step, keys.Provider):
+            p, src = step, keys.source(step.env)
+            card.border_title = p.name
+            body.append("required" if p.required else "optional", st["warning"] if p.required else st["muted"])
+            body.append(f" · {p.purpose}\n\n", st["body"])
+            if src == "env":
+                body.append("✓ ", st["success"])
+                body.append(f"{p.env} is set in your environment", st["body"])
+                hint = "enter  continue   ·   esc  later"
+            else:
+                if src == "file":
+                    body.append("✓ ", st["success"])
+                    body.append(f"stored key {keys.mask(keys.get(p.env) or '')}", st["body"])
+                    body.append(" · paste a new one to replace it", st["muted"])
+                else:
+                    body.append("get a key  ", st["muted"])
+                    body.append(p.url, st["meta_ref"])
+                inp.display = True
+                inp.placeholder = f"paste {p.env}"
+                inp.disabled = False
+                inp.value = ""
+                inp.focus()
+                hint = "enter  save   ·   enter on empty  " + ("keep" if src == "file" else "skip") + "   ·   esc  later"
+        elif step == "privacy":
+            card.border_title = "privacy"
+            body.append("Mercury trains on API traffic unless you opt out in the Inception\n", st["body"])
+            body.append("dashboard. hotel won't send lobby content to it until you confirm.\n\n", st["body"])
+            body.append("Have you turned the training opt-in ", st["body"])
+            body.append("off", st["warning"])
+            body.append("?\n\n", st["body"])
+            body.append("  y ", st["accent"])
+            body.append(" yes, it's off       ", st["body"])
+            body.append("  n ", st["accent"])
+            body.append(" not yet", st["body"])
+            hint = "y / n   ·   esc  later"
+        elif step == "theme":
+            card.border_title = "theme"
+            body.append("Pick a look. It changes as you move.\n\n", st["body"])
+            for name in self.app.pals:
+                cur = name == self.app.pal_name
+                body.append(" ❯ " if cur else "   ", st["accent"])
+                body.append(name + "\n", st["room_name"] if cur else st["muted"])
+            hint = "↑ ↓  choose   ·   enter  confirm"
+        else:
+            card.border_title = "ready"
+            left = keys.missing_required()
+            body.append("You're checked in.\n\n" if not left else "Almost there.\n\n", st["room_name"])
+            for p in keys.PROVIDERS:
+                ok = keys.source(p.env) is not None
+                body.append(" ✓ " if ok else " · ", st["success"] if ok else st["dead"])
+                body.append(f"{p.name:<22}", st["body"] if ok else st["muted"])
+                body.append("ready\n" if ok else ("missing\n" if p.required else "skipped\n"),
+                            st["muted"] if ok or not p.required else st["warning"])
+            if left:
+                body.append("\nsearch and model features stay off until the required keys are set (/setup)",
+                            st["muted"])
+            hint = "enter  open the lobby"
+        self.query_one("#ob-body", Static).update(body)
+        self.query_one("#ob-note", Static).update(self.note)
+        self.query_one("#ob-hint", Static).update(Text(hint))
+
+    def _progress(self) -> Text:
+        st, t = self.app.st, Text()
+        n_keys = len(keys.PROVIDERS)
+        groups = [("welcome", ["welcome"]), ("keys", [s for s in self.steps if isinstance(s, keys.Provider)])]
+        groups += [(s, [s]) for s in ("privacy", "theme", "ready") if s in self.steps]
+        for i, (label, members) in enumerate(groups):
+            if i:
+                t.append("  ─  ", st["dead"])
+            if self.step in members:
+                if label == "keys":
+                    label = f"keys {members.index(self.step) + 1}/{n_keys}"
+                t.append("● " + label, st["accent"])
+            elif self.steps.index(members[-1]) < self.n:
+                t.append("✓ " + label, st["success"])
+            else:
+                t.append("○ " + label, st["muted"])
+        return t
+
+    def _say(self, msg: str = "", style: str = "muted"):
+        self.note = Text(msg, self.app.st[style]) if msg else Text()
+        self.query_one("#ob-note", Static).update(self.note)
+
+    def advance(self):
+        self.query_one(Building).finish()
+        self.note = Text()
+        if self.step == "ready":
+            return self.action_finish()
+        self.n += 1
+        self.show()
+
+    # ------------------------------------------------------------- input
+    @on(Input.Submitted, "#ob-key")
+    def submitted(self, ev: Input.Submitted):
+        ev.stop()
+        if self.busy:
+            return
+        key = ev.value.strip()
+        if not key:
+            return self.advance()
+        p = self.step
+        if not self.check:
+            keys.set_key(p.env, key)
+            return self.advance()
+        self.busy = True
+        self.query_one("#ob-key", Input).disabled = True
+        self._say(f"checking with {p.name}…")
+        self.validate(p, key)
+
+    @work(thread=True, exclusive=True)
+    def validate(self, p: keys.Provider, key: str):
+        good, detail = keys.validate(p, key, post=self.post)
+        self.app.call_from_thread(self.validated, p, key, good, detail)
+
+    def validated(self, p: keys.Provider, key: str, good: bool | None, detail: str):
+        self.busy = False
+        inp = self.query_one("#ob-key", Input)
+        inp.disabled = False
+        if good is False:
+            inp.value = ""
+            inp.focus()
+            return self._say(f"✗ {detail} — check the key and try again", "error")
+        keys.set_key(p.env, key)
+        self.advance()
+        if good is None:  # saved, but say why it is unverified on the next step
+            self._say(f"{p.name}: saved {keys.mask(key)} ({detail})", "warning")
+
+    def on_key(self, event):
+        step = self.step
+        if isinstance(step, keys.Provider) and self.query_one("#ob-key", Input).display:
+            return  # the Input handles typing and enter
+        k = event.key
+        if step == "privacy" and k in ("y", "n"):
+            event.stop()
+            if k == "y":
+                keys.confirm_optout(self.hotel.paths)
+                self.hotel.cfg["inception_training_opt_out_confirmed"] = True
+            self.advance()
+            if k == "n":
+                self._say("not confirmed: model features stay blocked until you do (/setup)", "warning")
+        elif step == "theme" and k in ("up", "down", "left", "right", "k", "j"):
+            event.stop()
+            names = list(self.app.pals)
+            d = -1 if k in ("up", "left", "k") else 1
+            self.app.pal_name = names[(names.index(self.app.pal_name) + d) % len(names)]
+            self.app.theme = self.app.pal_name
+            self.query_one(Building).repaint()
+            self.show()
+        elif k == "enter" and step != "privacy":
+            event.stop()
+            if step == "theme":
+                self._save_theme()
+            self.advance()
+
+    def _save_theme(self):
+        from .config import save_config
+        cfg = self.hotel.paths
+        saved = json.loads(cfg.config.read_text(encoding="utf-8")) if cfg.config.exists() else {}
+        saved["theme"] = self.app.pal_name
+        save_config(cfg, saved)
+        self.hotel.cfg["theme"] = self.app.pal_name
+
+    def action_finish(self):
+        keys.mark_onboarded()
+        self.dismiss(None)
 
 # ======================================================================== modal
 class AnnotateScreen(ModalScreen):
@@ -203,9 +541,11 @@ class HotelApp(App):
         Binding("escape", "focus_cmd", "command", show=False),
     ]
 
-    def __init__(self, hotel: Hotel):
+    def __init__(self, hotel: Hotel, splash: bool | None = None, onboard: bool | None = None):
         super().__init__()
         self.hotel = hotel
+        self.splash = splash  # None: play the opening animation unless headless
+        self.onboard = onboard  # None: first-run onboarding unless headless or already done
         self.pals = palettes()
         self.pal_name = hotel.cfg.get("theme", "calculus-dark")
         self.room = hotel.cfg.get("default_room", "inbox")
@@ -263,6 +603,27 @@ class HotelApp(App):
             self.say("welcome. /help for commands. plain text is a monologue in [b]" + self.room + "[/b].")
         self.refresh_all()
         self.query_one("#cmd", Input).focus()
+        if (not self.is_headless and not keys.onboarded()) if self.onboard is None else self.onboard:
+            self.action_setup()
+        elif (not self.is_headless) if self.splash is None else self.splash:
+            self.push_screen(OpeningScreen(), self._entered)
+
+    def action_setup(self):
+        def done(_):
+            left = keys.missing_required()
+            self.say("checked in. /help for commands, /setup to change keys or theme." if not left else
+                     "missing API keys: " + ", ".join(p.env for p in left) + " — /setup when you have them",
+                     "success" if not left else "warning")
+            self.refresh_all()
+            self._entered(None)
+
+        self.push_screen(OnboardingScreen(self.hotel), done)
+
+    def _entered(self, ch: str | None):
+        cmd = self.query_one("#cmd", Input)
+        if ch:
+            cmd.insert_text_at_cursor(ch)
+        cmd.focus()
 
     # ------------------------------------------------------------- render
     def say(self, msg: str | Text, style: str = "muted"):
@@ -531,6 +892,8 @@ class HotelApp(App):
             return self.exit()
         if cmd == "help":
             return self.say(HELP, "body")
+        if cmd in ("setup", "onboard"):
+            return self.action_setup()
         if cmd in TYPE_CMDS:
             if not rest:
                 raise ValueError(f"/{cmd} needs text")

@@ -1,29 +1,31 @@
-"""Thin router over OpenAI-compatible chat endpoints (no SDK, no framework).
+"""Thin router over chat endpoints through each provider's own SDK (no framework).
 
 Every call goes through the gateway as a `model` row: the request goes to a blob
 (it can be large), the raw response is stored by hash, and the latency is in
 the payload. Inference is logged but not gated; the gate applies to tool calls.
 
-Profiles live in config["llm_profiles"]. Mercury is the default; any other
-OpenAI-compatible endpoint works the same way.
+Profiles live in config["llm_profiles"]. Mercury is the default (`inceptionai`
+SDK); Groq uses `groq`; any other OpenAI-compatible endpoint takes sdk="openai"
+plus a base_url.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import time
 from dataclasses import dataclass
 from typing import Callable
 
-import httpx
+import groq
+import inceptionai
+import openai
 
 from . import keys
 from .gateway import ToolResult, ToolSpec
 
 DEFAULT_PROFILES = {
     "mercury": {
-        "base_url": "https://api.inceptionlabs.ai/v1",
+        "sdk": "inception",
         "model": "mercury-3",
         "key_env": "INCEPTION_API_KEY",
         # Inception's own vocabulary: instant | low | medium | high
@@ -31,7 +33,7 @@ DEFAULT_PROFILES = {
         "require_training_optout": True,
     },
     "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
+        "sdk": "groq",
         "model": "openai/gpt-oss-120b",
         "key_env": "GROQ_API_KEY",
         "key_env_fallback": "HERMES_CUSTOM_GROQ_API_KEY",
@@ -45,22 +47,24 @@ class LLMError(RuntimeError):
     pass
 
 
-def _check(r: httpx.Response) -> httpx.Response:
-    """raise_for_status, but keep the server's explanation (cookbook pattern)."""
-    if r.is_error:
-        raise LLMError(f"{r.request.method} {r.request.url} -> {r.status_code}: {r.text[:400]}")
-    return r
+# sdk name -> (client class, its APIStatusError); keys.py probes keys through the same table
+SDKS = {
+    "inception": (inceptionai.Inception, inceptionai.APIStatusError),
+    "groq": (groq.Groq, groq.APIStatusError),
+    "openai": (openai.OpenAI, openai.APIStatusError),
+}
 
 
 @dataclass
 class Profile:
     name: str
-    base_url: str
+    sdk: str
     model: str
     key_env: str
     effort: dict
     require_training_optout: bool
     key_env_fallback: str | None = None
+    base_url: str | None = None  # None = the SDK's own default host
     price: dict | None = None  # {"in": usd_per_mtok, "out": usd_per_mtok}; set in config to log cost
 
     def key(self) -> str:
@@ -76,7 +80,7 @@ def get_profile(cfg: dict, name: str | None = None) -> Profile:
     if name not in profiles:
         raise LLMError(f"unknown llm profile {name!r}; known: {', '.join(profiles)}")
     p = {**DEFAULT_PROFILES.get(name, {}), **cfg.get("llm_profiles", {}).get(name, {})}  # partial overrides ok
-    return Profile(name=name, base_url=p["base_url"], model=p["model"], key_env=p["key_env"],
+    return Profile(name=name, sdk=p.get("sdk", "openai"), base_url=p.get("base_url"), model=p["model"], key_env=p["key_env"],
                    effort=p.get("effort", {}), require_training_optout=p.get("require_training_optout", False),
                    key_env_fallback=p.get("key_env_fallback"), price=p.get("price"))
 
@@ -90,19 +94,14 @@ def http_chat(profile: Profile, cfg: dict, body: dict) -> bytes:
             "refusing to send lobby content: turn off the API training opt-in in the provider dashboard, "
             "then set inception_training_opt_out_confirmed=true in .hotel/config.json"
         )
-    headers = {"Authorization": f"Bearer {profile.key()}", "Content-Type": "application/json"}
-    for attempt in range(5):
-        r = httpx.post(f"{profile.base_url}/chat/completions", json=body, headers=headers, timeout=120)
-        if (r.status_code == 429 or r.status_code >= 500) and attempt < 4:
-            # honour the provider's own hint (TPM windows) before blind backoff
-            try:
-                wait = float(r.headers.get("retry-after", ""))
-            except ValueError:
-                wait = 2 ** attempt
-            time.sleep(min(max(wait, 1.0), 30.0))
-            continue
-        return _check(r).content
-    raise LLMError("unreachable")
+    # the SDKs back off on 429/5xx and honours the provider's retry-after hint
+    client_cls, status_error = SDKS[profile.sdk]
+    client = client_cls(api_key=profile.key(), base_url=profile.base_url, timeout=120, max_retries=4)
+    try:
+        raw = client.chat.completions.with_raw_response.create(**body)
+    except status_error as ex:  # keep the server's explanation (cookbook pattern)
+        raise LLMError(f"POST {ex.request.url} -> {ex.status_code}: {ex.response.text[:400]}") from ex
+    return raw.http_response.content  # the exact bytes: they are stored by hash
 
 
 class LLM:

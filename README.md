@@ -90,7 +90,7 @@ In the TUI, plain text is appended to the current room as a monologue. Commands:
 
 ```
 /room <slug>     /bounty /goal /idea /reason /log <text>
-/s <q>           unified search (gated)   /exa <q>   /fetch <url>   /ls <q> lobby only (ungated)
+/s <q>           unified search (gated)   /exa <q>   /deep <q>   /fetch <url>   /ls <q> lobby only (ungated)
 /annotate        (ctrl+a / F2) claim + quote; pointer is computed and checked against the blob
 /close L R:n     /supersede L <text>   /contest L <why>   /reopen L <why>
 /tag L t         /link L L   /ref L R:n   /promote L
@@ -191,7 +191,7 @@ tool-calling loop with no framework, and it never writes to the lobby directly.
 `hotel mcp` exposes the lobby over the Model Context Protocol so that clients such as Claude, Amp, and
 Cursor can read and research in it. Clients get the same rights as the guest agent, enforced by the server:
 
-- **Tools:** `lobby_directory`, `lobby_search`, `read_entries`, `web_search`, `fetch`, `annotate`,
+- **Tools:** `lobby_directory`, `lobby_search`, `read_entries`, `web_search`, `deep_research`, `fetch`, `annotate`,
   `propose`, `review_queue`. **Resources:** `hotel://lobby`, `hotel://directory`.
 - Every call is a Reg row in its own `mcp` session. After `web_search` or `fetch`, all other tools are
   refused until the client annotates.
@@ -288,7 +288,8 @@ uv run pytest -q     # offline; the agent loop is driven by ScriptedTransport
 | Lobby grammar, parser, validator | Implemented | `grammar.py`, `validator.py` |
 | Edit ops, git commit per edit | Implemented | `models.py`, `ops.py`, `core.py` |
 | Librarian (`RuleLibrarian`, `ModelLibrarian`) | Implemented; Mercury path not tested against the live API (tested via scripted transport) | `librarian.py` |
-| Model router (OpenAI-compatible profiles, retries, opt-out guard) | Implemented | `llm.py` |
+| Model router (provider SDKs: `inceptionai`, `groq`, `openai`-compatible; retries, opt-out guard) | Implemented | `llm.py` |
+| Deep research (Exa Deep Search + Exa Agent runs, gated like any retrieval) | Implemented | `search.py` |
 | Research agent | Implemented; tested live with Exa and groq | `agent.py` |
 | Resident policy (log-only appends, rate cap, bounty close, review queue) | Implemented | `core.py` |
 | Unified search (lobby FTS5 + RAG FTS5 + Exa) | Implemented | `search.py` |
@@ -300,3 +301,13 @@ uv run pytest -q     # offline; the agent loop is driven by ScriptedTransport
 | Guest agent, custodian, move, forget, backup/restore, verifier, usage logging, install scripts | Implemented (v0.2) | `guest.py`, `core.py`, `backup.py`, `verify.py`, `scripts/` |
 | MCP server (stdio and HTTP with bearer token) | Implemented | `mcp_server.py` |
 | sqlite-vec embeddings, talk/solve agents, concierge, custodian dedup, hotel renderer | Not implemented | — |
+
+## Deep research
+
+`/deep <q>`, the research agent's `deep_research` tool (once per task) and the MCP `deep_research` tool run
+Exa's research products through the `exa-py` SDK. `depth: "deep"` is Deep Search (`type=deep`: Exa iterates
+its own searches, optional `angles` seed distinct sub-questions); `depth: "agent"` is an Exa Agent run
+(async, minutes, billed per run). Both land as one retrieval that must be annotated like any other: the
+selected pages are `external` with real highlights to quote, while Exa's synthesis is flagged `secondhand`.
+Agent runs are configured in `.hotel/config.json`: `exa_agent_effort` (default `medium`, fixed price per run),
+`exa_agent_max_cost` (USD cap, only for `auto`/`ultra`) and `exa_agent_timeout_s`.

@@ -114,6 +114,21 @@ def build_server(hotel) -> MCPServer:
             seen_q[:] = seen
             return f"RETRIEVAL R:{e.id} — annotate it next.\n\n{res.text}"
 
+    @mcp.tool(description="Deep web research by Exa (slow, costly): iterative searches plus a grounded synthesis. "
+                          "depth 'deep' takes seconds to a minute; 'agent' runs a full research agent for minutes. "
+                          "Use for multi-hop questions and exhaustive lists, not simple lookups. "
+                          "The pages are real sources to quote; the synthesis is secondhand. "
+                          "Returns retrieval R:<n>; annotate it next.")
+    def deep_research(query: str, depth: Literal["deep", "agent"] = "deep", angles: list[str] | None = None) -> str:
+        with lock:
+            gate("deep_research")
+            try:
+                e, res = gw.call("exa.deep", actor="mcp", gate_all=True, query=query, depth=depth,
+                                 angles=(angles or [])[:3])
+            except Exception as ex:
+                raise ToolError(f"deep research failed: {type(ex).__name__}: {str(ex)[:300]}") from None
+            return f"RETRIEVAL R:{e.id} — annotate it next.\n\n{res.text}"
+
     @mcp.tool(description="Fetch the full text of one URL. Returns retrieval R:<n>; annotate it next.")
     def fetch(url: str) -> str:
         with lock:

@@ -18,7 +18,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 
-import httpx
+from exa_py import Exa
+from parallel import Parallel
 
 from . import keys
 from .derived import Derived
@@ -73,35 +74,51 @@ def render_hits(query: str, hits: list[Hit], skipped: list[str] | None = None) -
     return "\n".join(out) + "\n"
 
 
-def _check(r: httpx.Response) -> httpx.Response:
-    if r.is_error:
-        raise RuntimeError(f"{r.request.method} {r.request.url} -> {r.status_code}: {r.text[:400]}")
-    return r
+def _retry(call, attempts: int = 5):
+    """Exa and Parallel raise on any HTTP error; back off on 429/5xx (bursty fan-out hits 429s)."""
+    for attempt in range(attempts):
+        try:
+            return call()
+        except Exception as ex:
+            status = getattr(ex, "status_code", None) or _status_in(ex)
+            if not (status == 429 or (status or 0) >= 500) or attempt == attempts - 1:
+                raise
+            time.sleep(2 ** attempt)
 
 
-def _post_retry(url: str, body: dict, headers: dict, timeout: float = 45) -> bytes:
-    for attempt in range(5):
-        r = httpx.post(url, json=body, headers=headers, timeout=timeout)
-        if (r.status_code == 429 or r.status_code >= 500) and attempt < 4:
-            time.sleep(2 ** attempt)  # bursty fan-out hits 429s
-            continue
-        return _check(r).content
-    raise RuntimeError("unreachable")
+def _status_in(ex: Exception) -> int | None:
+    """exa-py reports HTTP failures as ValueError('Request failed with status code 429: ...')."""
+    m = re.search(r"status code (\d{3})", str(ex))
+    return int(m.group(1)) if m else None
+
+
+def _with_sources(text: str, cites: dict[str, str | None]) -> str:
+    return text.strip() + ("\n\nSources cited by Exa:\n" + "\n".join(f"- {t or u} <{u}>" for u, t in cites.items()) if cites else "")
 
 
 # ------------------------------------------------------------------ Exa
-class ExaClient:
-    BASE = "https://api.exa.ai"
+RESEARCH_PROMPT = ("Prefer official and primary sources. Cover distinct angles, verify claims against "
+                   "more than one source where possible, and say plainly what could not be verified.")
 
+
+class ExaClient:
     def __init__(self, api_key: str | None = None, max_chars: int = 4000):
         self.api_key = api_key
         self.max_chars = max_chars
 
-    def _post(self, path: str, body: dict) -> bytes:
+    def _sdk(self, timeout: float = 45) -> Exa:
         key = self.api_key or keys.get("EXA_API_KEY")  # resolved per call: `hotel setup` can run while the TUI is open
         if not key:
             raise RuntimeError("EXA_API_KEY not set — run `hotel setup`")
-        return _post_retry(self.BASE + path, body, {"x-api-key": key, "content-type": "application/json"})
+        return Exa(api_key=key, timeout=timeout)
+
+    @staticmethod
+    def _raw(resp) -> bytes:
+        """The SDK parses the response; store what was parsed from it as JSON."""
+        return json.dumps({"results": [
+            {"id": r.id, "url": r.url, "title": r.title, "publishedDate": r.published_date,
+             "highlights": getattr(r, "highlights", None), "text": getattr(r, "text", None),
+             "summary": getattr(r, "summary", None)} for r in resp.results]}, ensure_ascii=False).encode()
 
     @staticmethod
     def _hits(raw: bytes, query: str | None = None) -> list[Hit]:
@@ -119,22 +136,61 @@ class ExaClient:
 
     def search(self, query: str, num_results: int = 5, mode: str = "text",
                highlight_chars: int = 2000) -> tuple[bytes, list[Hit]]:
-        contents = ({"highlights": {"maxCharacters": highlight_chars}} if mode == "highlights"
-                    else {"text": {"maxCharacters": self.max_chars}})
-        raw = self._post("/search", {"query": query, "type": "auto", "numResults": num_results, "contents": contents})
+        contents = ({"highlights": {"max_characters": highlight_chars}} if mode == "highlights"
+                    else {"text": {"max_characters": self.max_chars}})
+        exa = self._sdk()
+        raw = self._raw(_retry(lambda: exa.search(query, type="auto", num_results=num_results, contents=contents)))
         return raw, self._hits(raw, query)
 
+    def deep(self, query: str, angles: list[str] | None = None, num_results: int = 5, highlight_chars: int = 1500,
+             system_prompt: str = RESEARCH_PROMPT) -> tuple[bytes, list[Hit]]:
+        """Deep Search (`type=deep`): Exa iterates searches itself, then synthesizes. Returns the selected
+        pages (external, real highlights to quote) plus the grounded synthesis (secondhand)."""
+        exa = self._sdk(timeout=180)
+        resp = _retry(lambda: exa.search(
+            query, type="deep", num_results=num_results, additional_queries=angles or None, system_prompt=system_prompt,
+            output_schema={"type": "text", "description": "A grounded, concise answer; state what is unknown."},
+            contents={"highlights": {"max_characters": highlight_chars}}))
+        out = resp.output
+        raw = json.loads(self._raw(resp))
+        raw["output"] = {"content": out.content, "grounding": [
+            {"field": g.field, "confidence": g.confidence, "citations": [{"title": c.title, "url": c.url} for c in g.citations]}
+            for g in out.grounding]} if out else None
+        raw = json.dumps(raw, ensure_ascii=False).encode()
+        hits = self._hits(raw, query)
+        if out:
+            cites = {c.url: c.title for g in out.grounding for c in g.citations}
+            hits.append(Hit("exa-deep", "synthesis", "Exa Deep Search synthesis (secondhand; quote the pages instead when you can)",
+                            None, _with_sources(str(out.content), cites), utcnow(), "secondhand", query=query))
+        return raw, hits
+
+    def agent(self, query: str, effort: str = "medium", max_cost: float = 5, timeout_s: int = 900,
+              system_prompt: str = RESEARCH_PROMPT) -> tuple[bytes, list[Hit]]:
+        """Exa Agent run: async, multi-step research billed per run. Create, poll to a terminal state.
+        Output is Exa's own synthesis, so it is secondhand."""
+        exa = self._sdk()
+        budget = {"maxCostDollars": max_cost} if effort in ("auto", "ultra") else None  # fixed efforts reject a budget
+        run = exa.agent.runs.create(query=query, system_prompt=system_prompt, effort=effort, budget=budget)
+        run = exa.agent.runs.poll_until_finished(run.id, poll_interval=4000, timeout_ms=timeout_s * 1000)
+        raw = run.model_dump_json(by_alias=True).encode()
+        if run.status != "completed" or not run.output:
+            err = run.error.message if run.error else run.status
+            raise RuntimeError(f"Exa Agent run {run.id} {run.status}: {err}")
+        cites = {c.url: c.title for g in run.output.grounding or [] for c in g.citations}
+        text = run.output.text or json.dumps(run.output.structured, ensure_ascii=False)
+        return raw, [Hit("exa-agent", run.id, f"Exa Agent run {run.id} ({effort})", None,
+                         _with_sources(text, cites), utcnow(), "secondhand", query=query)]
+
     def fetch(self, urls: list[str]) -> tuple[bytes, list[Hit]]:
-        raw = self._post("/contents", {"urls": urls, "text": {"maxCharacters": self.max_chars * 3}})
+        exa = self._sdk()
+        raw = self._raw(_retry(lambda: exa.get_contents(urls, text={"max_characters": self.max_chars * 3})))
         return raw, self._hits(raw)
 
 
 # ------------------------------------------------------------------ Parallel
 class ParallelClient:
-    """Parallel Search API (body shape from Inception's cookbook). Untested
-    without PARALLEL_API_KEY."""
-
-    URL = "https://api.parallel.ai/v1/search"
+    """Parallel Search via the `parallel-web` SDK (shape from Inception's cookbook).
+    Untested without PARALLEL_API_KEY."""
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key
@@ -143,10 +199,10 @@ class ParallelClient:
         key = self.api_key or keys.get("PARALLEL_API_KEY")
         if not key:
             raise RuntimeError("PARALLEL_API_KEY not set — run `hotel setup`")
-        raw = _post_retry(self.URL, {
-            "objective": objective, "search_queries": queries, "mode": "turbo",
-            "advanced_settings": {"max_results": num_results * len(queries)},
-        }, {"x-api-key": key, "Content-Type": "application/json"})
+        client = Parallel(api_key=key, timeout=45, max_retries=0)  # _retry does the backoff
+        raw = _retry(lambda: client.search(
+            objective=objective, search_queries=queries, mode="turbo",
+            advanced_settings={"max_results": num_results * len(queries)})).model_dump_json().encode()
         now = utcnow()
         hits = [Hit("parallel", it.get("url") or "", it.get("title") or "", it.get("url"),
                     "\n".join(f"- {e.strip()}" for e in (it.get("excerpts") or [])), now, "external",
@@ -179,10 +235,19 @@ def clean_queries(raw: list, seen: list[set[str]], fanout: int) -> tuple[list[st
 # ------------------------------------------------------------------ tool fns
 def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
                parallel: ParallelClient | None = None, backend: str = "exa",
-               agent_num_results: int = 3, agent_highlight_chars: int = 700):
+               agent_num_results: int = 3, agent_highlight_chars: int = 700,
+               exa_agent_effort: str = "medium", exa_agent_max_cost: float = 5, exa_agent_timeout_s: int = 900):
     def exa_search(query: str) -> ToolResult:
         raw, hits = exa.search(query, num_results)
         return ToolResult(raw, render_hits(query, hits), hits, "exa")
+
+    def exa_deep(query: str, depth: str = "deep", angles: list[str] | None = None) -> ToolResult:
+        """depth "deep": Exa Deep Search, seconds, cheap. "agent": Exa Agent run, minutes, billed per run."""
+        if depth == "agent":
+            raw, hits = exa.agent(query, exa_agent_effort, exa_agent_max_cost, exa_agent_timeout_s)
+        else:
+            raw, hits = exa.deep(query, angles, num_results)
+        return ToolResult(raw, render_hits(f"deep[{depth}] {query}", hits), hits, f"exa-{depth}")
 
     def exa_fetch(url: str) -> ToolResult:
         raw, hits = exa.fetch([url])
@@ -255,5 +320,5 @@ def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
         return ToolResult(json.dumps(raws, ensure_ascii=False).encode(), text, hits,
                           f"{'parallel' if backend == 'parallel' and parallel else 'exa'}+rag")
 
-    return {"exa.search": exa_search, "exa.fetch": exa_fetch, "lobby.search": lobby_search,
+    return {"exa.search": exa_search, "exa.deep": exa_deep, "exa.fetch": exa_fetch, "lobby.search": lobby_search,
             "search": unified, "agent.search": agent_search}

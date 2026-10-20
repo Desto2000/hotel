@@ -40,7 +40,7 @@ TYPE_CMDS = {"bounty": "bounty", "goal": "goal", "idea": "idea", "reason": "reas
 
 HELP = r"""[b]write[/b]   plain text → monologue in current room · /bounty /goal /idea /reason /log <text>
 [b]rooms[/b]   /room <slug>
-[b]search[/b]  /s <q> unified (exa+rag+lobby) · /exa <q> · /fetch <url> · /ls <q> lobby only (ungated)
+[b]search[/b]  /s <q> unified (exa+rag+lobby) · /exa <q> · /deep <q> (Exa Deep Search) · /fetch <url> · /ls <q> lobby only (ungated)
 [b]gate[/b]    /annotate \[R:n] (ctrl+a) — required after every external retrieval
 [b]edit[/b]    /close L R:n · /supersede L <text> · /contest L <why> · /reopen L <why>
         /tag L t · /link L L · /ref L R:n · /promote L
@@ -170,9 +170,9 @@ class OnboardingScreen(Screen):
     #ob-hint { width: 100%; text-align: center; color: $hotel-muted; margin-top: 1; }
     """
 
-    def __init__(self, hotel: Hotel, *, check: bool = True, post=None):
+    def __init__(self, hotel: Hotel, *, check: bool = True, probe=None):
         super().__init__()
-        self.hotel, self.check, self.post = hotel, check, post
+        self.hotel, self.check, self.probe = hotel, check, probe
         self.steps: list = ["welcome", *keys.PROVIDERS]
         if not hotel.cfg.get("inception_training_opt_out_confirmed"):
             self.steps.append("privacy")
@@ -333,7 +333,7 @@ class OnboardingScreen(Screen):
 
     @work(thread=True, exclusive=True)
     def validate(self, p: keys.Provider, key: str):
-        good, detail = keys.validate(p, key, post=self.post)
+        good, detail = keys.validate(p, key, probe=self.probe)
         self.app.call_from_thread(self.validated, p, key, good, detail)
 
     def validated(self, p: keys.Provider, key: str, good: bool | None, detail: str):
@@ -886,7 +886,7 @@ class HotelApp(App):
             return self.say(f"backup → {info['snapshot']} ({info['reg_rows']} reg rows, "
                             f"{info['blobs_copied']} new blobs)", "success")
         args = shlex.split(rest, posix=True) if rest and cmd not in TYPE_CMDS and cmd not in (
-            "s", "exa", "ls", "supersede", "contest", "reopen") else rest.split()
+            "s", "exa", "deep", "ls", "supersede", "contest", "reopen") else rest.split()
 
         if cmd in ("q", "quit"):
             return self.exit()
@@ -905,10 +905,10 @@ class HotelApp(App):
                 raise ValueError("/room <slug>")
             self.room = args[0].lower()
             return self.say(f"room → {self.room} (created on first entry)")
-        if cmd in ("s", "exa", "fetch"):
+        if cmd in ("s", "exa", "deep", "fetch"):
             if not rest:
                 raise ValueError(f"/{cmd} needs a query")
-            tool = {"s": "search", "exa": "exa.search", "fetch": "exa.fetch"}[cmd]
+            tool = {"s": "search", "exa": "exa.search", "deep": "exa.deep", "fetch": "exa.fetch"}[cmd]
             # gate check up front so the UI refuses instantly
             if h.gateway.pending():
                 raise GateBlocked(h.gateway.pending())

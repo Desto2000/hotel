@@ -22,6 +22,32 @@ def fake_agent_search(queries, objective, skip_urls=None) -> ToolResult:  # offl
     return ToolResult(b'{"fake": true}', DOC, [], "fake")
 
 
+def test_deep_research_is_gated_and_budgeted(hotel):
+    seen = []
+
+    def fake_deep(query, depth="deep", angles=None) -> ToolResult:
+        seen.append((query, depth, angles))
+        return ToolResult(b'{"fake": true}', DOC, [], "fake")
+
+    hotel.gateway.register(ToolSpec("exa.deep", "retrieval", "fake", fake_deep))
+    b = hotel.apply([AppendOp(op="append", room="harness", type="bounty",
+                              body="Compare Exa date filters across endpoints", refs=[], tags=[])]).created[0]
+    steps = [
+        lambda body: call("deep_research", query="exa date filters", depth="agent", angles=["a", "b", "c", "d"]),
+        lambda body: call("annotate", target=last_rid(body), caused="answers bounty", caused_refs=[b],
+                          claims=[{"text": "date filters", "quote": "accepts startPublishedDate and endPublishedDate",
+                                   "relation": "supports", "lobby_refs": [b]}]),
+        lambda body: call("deep_research", query="again", depth="deep"),  # over budget (max_deep=1)
+        lambda body: {"content": f"Yes [R:{last_rid(body)}]."},
+    ]
+    tr = ScriptedTransport(steps)
+    run = ResearchAgent(hotel, LLM(hotel, "groq", transport=tr)).run(b)
+    tool_msgs = [m["content"] for m in tr.bodies[-1]["messages"] if m["role"] == "tool"]
+    assert seen == [("exa date filters", "agent", ["a", "b", "c"])]  # angles capped at 3, second call never ran
+    assert "deep_research budget exhausted" in tool_msgs[2]
+    assert run.output_id and len(run.retrievals) == 1
+
+
 @pytest.fixture
 def hotel(tmp_path):
     init_home(tmp_path)

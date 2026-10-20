@@ -78,6 +78,9 @@ DEFAULT_CONFIG = {
     "resident_rate_cap_per_hour": 30,
     "exa_num_results": 5,
     "exa_max_chars": 4000,
+    "exa_agent_effort": "medium",  # minimal|low|medium|high|xhigh (fixed price per run) | auto|ultra (metered, capped below)
+    "exa_agent_max_cost": 5,  # USD ceiling, only used by auto/ultra
+    "exa_agent_timeout_s": 900,
     "default_room": "inbox",
     "theme": "calculus-dark",
 }

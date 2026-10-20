@@ -11,13 +11,14 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import re
 import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-import httpx
+from exa_py import Exa
 
 KEYS_FILE = Path.home() / ".config" / "hotel" / "keys.json"
 
@@ -30,22 +31,47 @@ class Provider:
     url: str  # where to get a key
     required: bool = False
     aliases: tuple[str, ...] = ()
-    check: tuple[str, str, str] | None = None  # (method, url, auth header kind: "bearer" | "x-api-key")
-    check_body: dict | None = None
+    check: Callable[[str], int] | None = None  # cheap SDK call with the key -> HTTP status; raises OSError when unreachable
+
+
+def _exa_status(key: str) -> int:
+    try:
+        Exa(api_key=key, timeout=15).search("hotel", num_results=1)
+    except ValueError as ex:  # exa-py: "Request failed with status code 401: ..."
+        m = re.search(r"status code (\d{3})", str(ex))
+        if m:
+            return int(m.group(1))
+        raise
+    return 200
+
+
+def _models_status(sdk: str) -> Callable[[str], int]:
+    def check(key: str) -> int:
+        from .llm import SDKS  # llm imports keys; resolved lazily
+        client_cls, status_error = SDKS[sdk]
+        try:
+            client_cls(api_key=key, timeout=15, max_retries=0).models.list()
+        except status_error as ex:
+            return ex.status_code
+        except Exception as ex:  # the SDKs' own connection/timeout errors are not OSErrors
+            if ex.__class__.__name__ in ("APIConnectionError", "APITimeoutError"):
+                raise ConnectionError(str(ex)) from ex
+            raise
+        return 200
+    return check
 
 
 PROVIDERS = [
     Provider("EXA_API_KEY", "Exa", "web search for the research agent and /s, /exa, /fetch", "https://dashboard.exa.ai/api-keys",
              required=True, aliases=("MCP_EXA_API_KEY",),
-             check=("POST", "https://api.exa.ai/search", "x-api-key"),
-             check_body={"query": "hotel", "numResults": 1}),
+             check=_exa_status),
     Provider("INCEPTION_API_KEY", "Mercury (Inception)", "default model for the agent, guest and model librarian",
              "https://platform.inceptionlabs.ai/", required=True,
-             check=("GET", "https://api.inceptionlabs.ai/v1/models", "bearer")),
+             check=_models_status("inception")),
     Provider("PARALLEL_API_KEY", "Parallel", "optional alternative search backend", "https://platform.parallel.ai/"),
     Provider("GROQ_API_KEY", "Groq", "optional `groq` model profile", "https://console.groq.com/keys",
              aliases=("HERMES_CUSTOM_GROQ_API_KEY",),
-             check=("GET", "https://api.groq.com/openai/v1/models", "bearer")),
+             check=_models_status("groq")),
 ]
 BY_ENV = {p.env: p for p in PROVIDERS}
 
@@ -107,21 +133,20 @@ def mask(key: str) -> str:
     return key[:4] + "…" + key[-2:] if len(key) > 10 else "…"
 
 
-def validate(p: Provider, key: str, *, post: Callable | None = None) -> tuple[bool | None, str]:
-    """(True|False|None, detail). None = cannot tell (no check endpoint, or network trouble);
-    only a 401/403 counts as a bad key."""
-    if p.check is None:
+def validate(p: Provider, key: str, *, probe: Callable[[str], int] | None = None) -> tuple[bool | None, str]:
+    """(True|False|None, detail). None = cannot tell (no check, or network trouble);
+    only a 401/403 counts as a bad key. `probe(key)` returns an HTTP status (tests inject it)."""
+    check = probe or p.check
+    if check is None:
         return None, "no cheap check available; key saved unverified"
-    method, url, kind = p.check
-    headers = {"Authorization": f"Bearer {key}"} if kind == "bearer" else {"x-api-key": key}
     try:
-        r = (post or httpx.request)(method, url, headers=headers, json=p.check_body, timeout=15)
-    except httpx.HTTPError as ex:
-        return None, f"could not reach {url}: {ex.__class__.__name__}"
-    if r.status_code in (401, 403):
-        return False, f"rejected ({r.status_code})"
-    if r.is_error and r.status_code != 429:
-        return None, f"unexpected {r.status_code}; key may still be fine"
+        status = check(key)
+    except OSError as ex:  # requests (Exa) and our own ConnectionError (OpenAI) both derive from OSError
+        return None, f"could not reach {p.name}: {ex.__class__.__name__}"
+    if status in (401, 403):
+        return False, f"rejected ({status})"
+    if status >= 400 and status != 429:
+        return None, f"unexpected {status}; key may still be fine"
     return True, "accepted"
 
 
@@ -155,7 +180,7 @@ def confirm_optout(home) -> None:
 # ------------------------------------------------------------------ wizard
 def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[str], str] = getpass.getpass,
             out: Callable[[str], None] = print, check: bool = True, only: list[str] | None = None,
-            post: Callable | None = None) -> bool:
+            probe: Callable[[str], int] | None = None) -> bool:
     """Walk the user through each provider. Enter keeps the current state / skips.
     Returns True when every required key is available afterwards."""
     out("hotel setup — API keys\n")
@@ -183,7 +208,7 @@ def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[s
                 out("  skipped\n")
                 break
             if check:
-                good, detail = validate(p, key, post=post)
+                good, detail = validate(p, key, probe=probe)
                 if good is False:
                     out(f"  {detail} — check the key and try again")
                     continue

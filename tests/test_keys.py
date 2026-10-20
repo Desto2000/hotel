@@ -1,6 +1,5 @@
 """API key store + onboarding wizard (no network, no real ~/.config)."""
 
-import httpx
 import pytest
 
 from hotel import keys
@@ -20,7 +19,7 @@ def isolated(tmp_path, monkeypatch):
 
 
 def resp(status):
-    return lambda *a, **k: httpx.Response(status, request=httpx.Request("GET", "http://x"))
+    return lambda key: status
 
 
 def test_env_beats_file_and_alias_resolves(monkeypatch):
@@ -40,13 +39,13 @@ def test_model_profile_reads_stored_key_and_error_points_to_setup():
 
 def test_validate_only_auth_failure_is_bad_key():
     p = keys.BY_ENV["INCEPTION_API_KEY"]
-    assert keys.validate(p, "k", post=resp(200))[0] is True
-    assert keys.validate(p, "k", post=resp(401))[0] is False
-    assert keys.validate(p, "k", post=resp(500))[0] is None  # provider trouble != wrong key
+    assert keys.validate(p, "k", probe=resp(200))[0] is True
+    assert keys.validate(p, "k", probe=resp(401))[0] is False
+    assert keys.validate(p, "k", probe=resp(500))[0] is None  # provider trouble != wrong key
 
-    def boom(*a, **k):
-        raise httpx.ConnectError("offline")
-    assert keys.validate(p, "k", post=boom)[0] is None
+    def boom(key):
+        raise ConnectionError("offline")
+    assert keys.validate(p, "k", probe=boom)[0] is None
     assert keys.validate(keys.BY_ENV["PARALLEL_API_KEY"], "k")[0] is None  # no check endpoint
 
 
@@ -58,10 +57,10 @@ def script(answers):
 def test_wizard_retries_rejected_key_saves_good_one_and_records_optout(tmp_path):
     paths = init_home(tmp_path / "home")
     statuses = iter([401, 200, 200])  # exa: bad, then good; mercury: good
-    post = lambda *a, **k: httpx.Response(next(statuses), request=httpx.Request("GET", "http://x"))
+    probe = lambda key: next(statuses)
     out = []
     ok = keys.onboard(home=paths, ask=script(["y"]), secret=script(["bad", "good-exa", "mercury-key", "", ""]),
-                      out=out.append, post=post)
+                      out=out.append, probe=probe)
     assert ok
     assert keys.get("EXA_API_KEY") == "good-exa" and keys.get("INCEPTION_API_KEY") == "mercury-key"
     assert keys.get("PARALLEL_API_KEY") is None  # skipped with Enter

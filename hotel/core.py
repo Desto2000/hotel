@@ -118,10 +118,13 @@ class Hotel:
         fns = make_tools(exa, self.rag, self.derived, self.cfg["exa_num_results"],
                          parallel=ParallelClient(), backend=self.cfg.get("search_backend", "exa"),
                          agent_num_results=self.cfg.get("agent_num_results", 3),
-                         agent_highlight_chars=self.cfg.get("agent_highlight_chars", 700))
+                         agent_highlight_chars=self.cfg.get("agent_highlight_chars", 700),
+                         exa_agent_effort=self.cfg["exa_agent_effort"], exa_agent_max_cost=self.cfg["exa_agent_max_cost"],
+                         exa_agent_timeout_s=self.cfg["exa_agent_timeout_s"])
         self.gateway.register(ToolSpec("search", "retrieval", "unified", fns["search"]))
         self.gateway.register(ToolSpec("agent.search", "retrieval", "web+rag", fns["agent.search"]))
         self.gateway.register(ToolSpec("exa.search", "retrieval", "exa", fns["exa.search"]))
+        self.gateway.register(ToolSpec("exa.deep", "retrieval", "exa", fns["exa.deep"]))
         self.gateway.register(ToolSpec("exa.fetch", "retrieval", "exa", fns["exa.fetch"]))
         self.gateway.register(ToolSpec("lobby.search", "internal", "lobby", fns["lobby.search"]))
         self.rebuild()

@@ -45,8 +45,6 @@ def test_two_fast_guest_messages_both_answered(tmp_path):
 
 
 def test_onboarding_saves_only_accepted_keys_and_finishes(tmp_path, monkeypatch):
-    import httpx
-
     from hotel import keys
     from hotel.tui import OnboardingScreen
     monkeypatch.setattr(keys, "KEYS_FILE", tmp_path / "cfg" / "keys.json")
@@ -55,12 +53,12 @@ def test_onboarding_saves_only_accepted_keys_and_finishes(tmp_path, monkeypatch)
     init_home(tmp_path / "home")
     h = Hotel(Paths(tmp_path / "home"))
     codes = iter([401, 200])
-    post = lambda *a, **k: httpx.Response(next(codes), request=httpx.Request("GET", "http://x"))
+    probe = lambda key: next(codes)
 
     async def go():
         app = HotelApp(h, splash=False, onboard=False)
         async with app.run_test(size=(120, 44)) as pilot:
-            app.push_screen(OnboardingScreen(h, post=post))
+            app.push_screen(OnboardingScreen(h, probe=probe))
             await pilot.pause()
             await pilot.press("enter")  # welcome -> Exa
             for key in ("wrong-key", "right-key"):

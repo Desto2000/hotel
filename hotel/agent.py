@@ -32,6 +32,7 @@ Workflow
 1. Call `search` with 1-3 queries that attack the question from different angles. Prefer official, primary sources.
 2. Immediately call `annotate` on the retrieval you just got (its id is in the result header, e.g. R:12). The harness rejects every other call until you do.
 3. Search again only for facts that are still missing or need verification. Never repeat a query.
+   For a question that needs multi-hop research, comparison across many sources or an exhaustive list, call `deep_research` once instead (slow and costly; never for a simple lookup). Its pages are real sources: quote those. Its synthesis is secondhand: quote it only when no page states the point.
 4. Stop as soon as the evidence answers the question. Reply with plain text and NO tool call: at most 120 words, no markdown, every factual sentence cites its retrieval inline like [R:12]. If something is unsupported, say it is unknown.
 
 How annotate is verified (mechanically, by the harness)
@@ -48,6 +49,17 @@ TOOLS = [
             "queries": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3,
                         "description": "1-3 distinct, specific search queries"}},
             "required": ["queries"]}}},
+    {"type": "function", "function": {
+        "name": "deep_research",
+        "description": "Deep web research by Exa: iterative searches plus a grounded synthesis. Slow and costly; at most once per task. "
+                       "depth 'deep' takes seconds to a minute; 'agent' runs a full research agent for minutes (list building, multi-hop questions). "
+                       "Returns a retrieval R:<n> you must annotate next.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "the research task: what to find, scope, evidence required"},
+            "depth": {"type": "string", "enum": ["deep", "agent"]},
+            "angles": {"type": "array", "items": {"type": "string"}, "maxItems": 3,
+                       "description": "optional, depth=deep only: distinct sub-questions to start from, not rephrasings"}},
+            "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "fetch",
         "description": "Fetch the full text of one URL seen in a previous retrieval. Also must be annotated.",
@@ -156,11 +168,11 @@ class RunResult:
 
 class ResearchAgent:
     def __init__(self, hotel, llm: LLM | None = None, *, max_turns: int = 14, max_searches: int = 4,
-                 fanout: int = 3, budget_chars: int = 60_000, on_event=None, verifier_transport=None):
+                 max_deep: int = 1, fanout: int = 3, budget_chars: int = 60_000, on_event=None, verifier_transport=None):
         self.h = hotel
         self.verifier_transport = verifier_transport
         self.llm = llm or LLM(hotel, role="agent")
-        self.max_turns, self.max_searches, self.fanout = max_turns, max_searches, fanout
+        self.max_turns, self.max_searches, self.max_deep, self.fanout = max_turns, max_searches, max_deep, fanout
         self.budget_chars = budget_chars
         self.on_event = on_event or (lambda s: None)
 
@@ -175,7 +187,7 @@ class ResearchAgent:
         return (f"Bounty {e.id} in room '{e.room}' ({e.type}, {e.status}):\n{e.text}\n\n"
                 f"Possibly related lobby entries (the user's own notes, not evidence):\n{rel}\n\n"
                 f"Use lobby_refs ['{e.id}'] when a claim supports or contradicts the bounty. "
-                f"You have at most {self.max_searches} searches.")
+                f"You have at most {self.max_searches} searches and {self.max_deep} deep_research call.")
 
     def _compact(self, messages: list[dict], ann_text: dict[int, str]) -> None:
         size = sum(len(m.get("content") or "") for m in messages)
@@ -213,6 +225,17 @@ class ResearchAgent:
                 run.tool_ms += e.payload.get("ms", 0)
                 note = f"\n(rejected queries: {'; '.join(rejected)})" if rejected else ""
                 return f"RETRIEVAL R:{e.id} — annotate it next.{note}\n\n{res.text}", e.id
+            if name == "deep_research":
+                if state["deep"] >= self.max_deep:
+                    return "ERROR: deep_research budget exhausted. Use search, or answer now.", None
+                depth = "agent" if args.get("depth") == "agent" else "deep"
+                e, res = gw.call("exa.deep", actor="agent", gate_all=True, query=str(args.get("query", "")),
+                                 depth=depth, angles=list(args.get("angles") or [])[:3])
+                state["deep"] += 1
+                state["urls"].update(h.url for h in res.data if h.url)
+                run.retrievals.append(e.id)
+                run.tool_ms += e.payload.get("ms", 0)
+                return f"RETRIEVAL R:{e.id} — annotate it next.\n\n{res.text}", e.id
             if name == "fetch":
                 e, res = gw.call("exa.fetch", actor="agent", gate_all=True, url=str(args.get("url", "")))
                 run.retrievals.append(e.id)
@@ -249,7 +272,7 @@ class ResearchAgent:
         objective = self.h.lobby().entries[bounty_id].text if bounty_id in self.h.lobby().entries else bounty_id
         messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": self._opening(bounty_id)}]
         run = RunResult(bounty_id, None, "")
-        state = {"searches": 0, "seen_q": [], "urls": set(), "objective": objective, "ann_text": {}}
+        state = {"searches": 0, "deep": 0, "seen_q": [], "urls": set(), "objective": objective, "ann_text": {}}
         nudges = 0
         for turn in range(self.max_turns):
             run.turns = turn + 1

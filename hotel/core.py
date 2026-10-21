@@ -23,7 +23,10 @@ from .models import (
     AppendOp, CloseOp, ContestOp, LinkOp, MoveOp, PromoteOp, ReopenOp, SupersedeOp, TagOp, op_dump, op_load,
 )
 from .ops import OpError, apply_op
-from .rag import Rag
+from .concierge import labels
+from .concierge.embed import make_embedder
+from .concierge.index import VectorIndex
+from .rag import Rag, embed_text, importable_files, read_document
 from .reg import Reg, utcnow
 from .search import ExaClient, ParallelClient, make_tools
 from .validator import validate_transition, validate_text
@@ -103,8 +106,10 @@ class Hotel:
         self.blobs = BlobStore(paths.blobs)
         self.events = EventLog(paths.log, source or label)
         self.reg = Reg(paths.reg_db, self.events)
-        self.rag = Rag(paths.rag_db)
-        self.derived = Derived(paths.derived_db)
+        emb = make_embedder(self.cfg)
+        self.index = VectorIndex(paths.vectors_db, emb) if emb else None
+        self.rag = Rag(paths.rag_db, self.blobs, self.index)
+        self.derived = Derived(paths.derived_db, self.index)
         self.oracle = Oracle(self.reg)
         cur_file = paths.state / "session"
         if session_id is None and not new_session and cur_file.exists():
@@ -115,7 +120,7 @@ class Hotel:
             if label == "tui":  # other front ends (mcp) leave the TUI's current session alone
                 cur_file.write_text(session_id)
         self.session_id = session_id
-        self.gateway = Gateway(self.reg, self.blobs, session_id, self.lobby_ids)
+        self.gateway = Gateway(self.reg, self.blobs, session_id, self.lobby_ids, rag_exists=self.rag.exists)
         exa = ExaClient(max_chars=self.cfg["exa_max_chars"])
         fns = make_tools(exa, self.rag, self.derived, self.cfg["exa_num_results"],
                          parallel=ParallelClient(), backend=self.cfg.get("search_backend", "exa"),
@@ -343,9 +348,47 @@ class Hotel:
                     hashes.append(a.payload["annotation_blob"])
         hashes = sorted(set(hashes))
         deleted = [h for h in hashes if self.blobs.delete(h)]
+        labels.invalidate(self)
         self.gateway.log("redaction", actor, ref_id=rid, payload={"blobs": hashes, "deleted": len(deleted),
                                                                   "reason": reason})
         return {"target": rid, "blobs": hashes, "deleted": len(deleted)}
+
+    # ------------------------------------------------------------- RAG
+    def rag_import(self, paths: list[Path], title: str | None = None, actor: str = "user",
+                   progress=None) -> list[tuple[Path, int, bool]]:
+        """Import files or directories. Holds the lobby lock, like promotion, so a RAG id
+        reserved by a concurrent /promote can never be taken. Returns (file, id, new)."""
+        out = []
+        for f in importable_files(paths):
+            doc_title, text = read_document(f)
+            if not text.strip():
+                continue
+            with file_lock(self.paths.state / "lobby.lock"):
+                before = self.rag.next_id()
+                did = self.rag.add("import", str(f.resolve()), title or doc_title, text)
+            new = did >= before
+            if new:
+                d = self.rag.get(did)
+                self.gateway.log("internal", actor, tool="rag.import", provider="rag",
+                                 payload={"rag_id": did, "blob": d["blob"], "chars": d["chars"],
+                                          **self.gateway._args_payload({"file": str(f)})})
+            out.append((f, did, new))
+            if progress:
+                progress(f, did, new)
+        if self.index is not None:  # embed now, so the first search is not the one that pays for it
+            self.index.ensure([embed_text(c) for c in self.rag.chunks()])
+        return out
+
+    def forget_rag(self, doc_id: int, reason: str, actor: str = "user") -> dict:
+        """Delete an imported or promoted document's text, chunks and vectors; the id stays."""
+        if not reason.strip():
+            raise ValueError("a reason is required (it is logged; the content is not)")
+        info = self.rag.forget(doc_id)
+        labels.invalidate(self)
+        self.gateway.log("redaction", actor, payload={"rag": doc_id, "blobs": [info["blob"]] if info["blob"] else [],
+                                                      "deleted": int(info["deleted"]), "chunks": info["chunks"],
+                                                      "reason": reason})
+        return info
 
     # ------------------------------------------------------------- agent outputs
     def accept_output(self, output_id: int, room: str | None = None) -> ApplyResult:

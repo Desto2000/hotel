@@ -16,6 +16,7 @@ New to Hotel? Start with the [tutorial](TUTORIAL.md). It walks through one full 
 - [Usage](#usage)
 - [Lobby grammar](#lobby-grammar)
 - [Agents](#agents)
+- [RAG and the Concierge](#rag-and-the-concierge)
 - [MCP server](#mcp-server)
 - [Data safety](#data-safety)
 - [Lifecycle and model checks](#lifecycle-and-model-checks)
@@ -113,7 +114,7 @@ hotel add | search | annotate <json> | lib <rid> | research <L> | guest "<msg>" 
       | accept <rid> | move <L> <room> | custodian | backup [dir] | restore <src> <dst>
       | forget <rid> --reason | home [dir] | setup | keys list|set|rm | doctor | version
       | timings | log | render | snapshot | review list|approve|reject | check | verify | rebuild
-      | reg | replay <session> | rag-import | sessions | schema
+      | reg | replay <session> | rag import|list|forget | labels | sessions | schema
       | mcp [--http --host --port --token]
 ```
 
@@ -188,6 +189,56 @@ tool-calling loop with no framework, and it never writes to the lobby directly.
   it with `origin=approved`.
 - The guest's replies are not written to the lobby.
 - Start a line with `>` to talk without recording it. Messages sent while a turn is running are queued.
+
+## RAG and the Concierge
+
+### RAG
+
+```
+hotel rag import notes/ paper.pdf page.html   # files or directories (md, txt, rst, org, html, pdf)
+hotel rag list
+hotel rag forget 3 --reason "private"          # text, chunks and vectors go; RAG:3 still resolves
+```
+
+- Each document's text is a content-addressed blob, so `forget` and backups cover it, and an identical
+  import is de-duplicated.
+- Documents are split into chunks that follow their structure: headings, paragraphs, and code fences, which
+  are never split. Chunks are exact spans of the stored text, cited as `RAG:<n>#<k>`. Each chunk is indexed
+  with its heading path (`Guide > Install > Windows`).
+- Search is hybrid. bm25 (FTS5) and dense vectors from a local embedding model are fused with reciprocal
+  rank fusion. The lobby uses the same hybrid search.
+- Annotations referencing `RAG:<n>` or `RAG:<n>#<k>` that do not exist are rejected.
+- The embedder runs locally through ONNX (`"embedder": "fastembed:google/embeddinggemma-300m"`, multilingual).
+  The first use downloads it (about 1.2 GB) to `~/.cache/hotel/models` in the background; until then search
+  is lexical. Use `"embedder": "none"` or `HOTEL_EMBEDDER=none` to turn it off. Vectors are cached in
+  `.hotel/vectors.sqlite` by text hash, which can be deleted at any time and is not backed up.
+
+### Next-edit suggestions
+
+While you write a note, Mercury Edit 2 proposes how the line continues as ghost text (Tab or ? accepts). Its
+context is filled locally first: the top lobby entries and RAG chunks for your draft, the room's latest
+entries, and the notes you wrote this session. Nothing from the web is used. Suggestions only ever extend
+the draft, because the lobby is append-only. Each request is a `model` row in the Reg; each shown
+suggestion's outcome (accepted, partial or ignored) is a `suggest.outcome` row holding only ids and lengths.
+Turn it off with `"suggest": false`. It needs `INCEPTION_API_KEY` and the training opt-out, and it stays
+silent without them.
+
+### The Concierge
+
+The Concierge is Hotel's own model stack beside Mercury. Mercury writes; the Concierge is meant to decide
+what is relevant, what a source says and whether a claim holds, locally and trained on your own Reg. What
+exists today:
+
+- `hotel labels` mines training and evaluation data from the Reg: quote spans of accepted annotations
+  (pointer), which hits of each retrieval were quoted (relevance, with the bm25, dense and fused ranks they
+  had), lobby entry and evidence pairs, suggestion outcomes and review decisions. It also reports retrieval
+  quality: hit@1, hit@3, MRR, and MRR per local ranking.
+- `hotel labels --export` writes `.hotel/labels/*.jsonl` and a manifest with the Reg head it was built from.
+  `forget` deletes the export, since it may hold copies of the forgotten content.
+- When a model's quote is rejected, the correction now names the closest real sentence in the source.
+
+Trained heads (embedding, span pointer, verifier, structure) and the graph layer are the next step; they plug
+in behind the embedder and pointer interfaces in `hotel/concierge/`.
 
 ## MCP server
 

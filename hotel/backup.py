@@ -35,7 +35,8 @@ def _sqlite_copy(src: Path, dst: Path) -> None:
     d.close()
 
 
-def referenced_blobs(reg_db: Path) -> set[str]:
+def referenced_blobs(reg_db: Path, rag_db: Path | None = None) -> set[str]:
+    """Blobs the Reg (and, given rag_db, the RAG store's live documents) point at."""
     c = sqlite3.connect(str(reg_db))
     out: set[str] = set()
     for rh, th, payload in c.execute("SELECT result_hash, text_hash, payload FROM reg"):
@@ -52,6 +53,13 @@ def referenced_blobs(reg_db: Path) -> set[str]:
     for (payload,) in c.execute("SELECT payload FROM reg WHERE kind='redaction'"):
         redacted.update(json.loads(payload).get("blobs", []))
     c.close()
+    if rag_db is not None and rag_db.exists():
+        r = sqlite3.connect(str(rag_db))
+        try:
+            out.update(h for (h,) in r.execute("SELECT blob FROM docs WHERE blob IS NOT NULL"))
+        except sqlite3.OperationalError:  # v1 store: text was inline
+            pass
+        r.close()
     return out - redacted
 
 
@@ -73,7 +81,7 @@ def backup(paths: Paths, dest: Path) -> dict:
     if r.returncode != 0:
         raise RuntimeError(f"git bundle failed: {r.stderr.strip()}")
     copied = present = 0
-    for h in referenced_blobs(snap / "reg.sqlite"):
+    for h in referenced_blobs(snap / "reg.sqlite", snap / "rag.sqlite"):
         src = paths.blobs / h[:2] / h[2:]
         dst = dest / "blobs" / h[:2] / h[2:]
         if dst.exists():
@@ -120,7 +128,7 @@ def restore(src: Path, target: Path, snapshot: str | None = None) -> dict:
         if (snap / name).exists():
             shutil.copy2(snap / name, paths.state / name)
     missing = []
-    for h in referenced_blobs(paths.reg_db):
+    for h in referenced_blobs(paths.reg_db, paths.rag_db):
         s = src / "blobs" / h[:2] / h[2:]
         if not s.exists():
             missing.append(h)

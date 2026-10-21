@@ -64,6 +64,7 @@ class Gateway:
     session_id: str
     lobby_ids: Callable[[], set[str]]
     tools: dict[str, ToolSpec] = field(default_factory=dict)
+    rag_exists: Callable[[str], bool] | None = None  # RAG:<n>[#<k>] -> stored? (None: format check only)
 
     def register(self, spec: ToolSpec) -> None:
         self.tools[spec.name] = spec
@@ -123,7 +124,7 @@ class Gateway:
 
     # ------------------------------------------------------------- annotate
     def annotate(self, ann: Annotation, actor: str = "user") -> RegEntry:
-        errs = validate_annotation(ann, self.reg, self.blobs, self.lobby_ids())
+        errs = validate_annotation(ann, self.reg, self.blobs, self.lobby_ids(), self.rag_exists)
         # quotes are retrieval content -> blob (forgettable); row keeps hash + shape
         h = self.blobs.put_text(json.dumps(ann.model_dump(mode="json"), sort_keys=True, ensure_ascii=False))
         payload = {"annotation_blob": h, "claims": len(ann.claims),
@@ -158,16 +159,20 @@ def load_args(row: RegEntry, blobs: BlobStore) -> dict | None:
     return p.get("args")
 
 
-def _ref_ok(ref: str, lobby_ids: set[str], reg: Reg) -> bool:
+def _ref_ok(ref: str, lobby_ids: set[str], reg: Reg, rag_exists: Callable[[str], bool] | None = None) -> bool:
     head = ref.split("#")[0]
     if ID_RE.match(head):
         return head in lobby_ids
     if head.startswith("R:") and head[2:].isdigit():
         return reg.get(int(head[2:])) is not None
-    return bool(re.match(r"^RAG:\d+$", head))
+    if re.match(r"^RAG:\d+$", head):
+        frag = ref.partition("#")[2]
+        return rag_exists(ref if frag.isdigit() else head) if rag_exists else True
+    return False
 
 
-def validate_annotation(ann: Annotation, reg: Reg, blobs: BlobStore, lobby_ids: set[str]) -> list[str]:
+def validate_annotation(ann: Annotation, reg: Reg, blobs: BlobStore, lobby_ids: set[str],
+                        rag_exists: Callable[[str], bool] | None = None) -> list[str]:
     errs: list[str] = []
     target = reg.get(ann.target)
     if target is None or target.kind != "retrieval" or target.status != "ok":
@@ -191,10 +196,10 @@ def validate_annotation(ann: Annotation, reg: Reg, blobs: BlobStore, lobby_ids: 
         if c.relation in ("supports", "contradicts") and not c.lobby_refs:
             errs.append(f"claim {i}: '{c.relation}' needs at least one lobby ref")
         for r in c.lobby_refs:
-            if not _ref_ok(r, lobby_ids, reg):
+            if not _ref_ok(r, lobby_ids, reg, rag_exists):
                 errs.append(f"claim {i}: lobby ref {r} does not exist")
     for r in ann.caused_refs:
-        if not _ref_ok(r, lobby_ids, reg):
+        if not _ref_ok(r, lobby_ids, reg, rag_exists):
             errs.append(f"caused_refs: {r} does not exist")
     return errs
 

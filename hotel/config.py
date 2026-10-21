@@ -6,7 +6,9 @@
   .hotel/reg.sqlite      Reg: immutable append-only log + review queue
   .hotel/blobs/          content-addressed raw results (sha256)
   .hotel/derived.sqlite  FTS index over the lobby (derived, rebuildable)
-  .hotel/rag.sqlite      imported / promoted knowledge
+  .hotel/rag.sqlite      imported / promoted knowledge (doc metadata + chunk index; text in blobs)
+  .hotel/vectors.sqlite  embedding cache keyed by text hash (derived, not backed up)
+  .hotel/labels/         training/eval data exported from the Reg (`hotel labels --export`)
   .hotel/config.json     local settings
   .hotel/hotel.log       event timeline (JSON lines; `hotel log` follows it)
 """
@@ -56,6 +58,14 @@ class Paths:
         return self.state / "rag.sqlite"
 
     @property
+    def vectors_db(self) -> Path:
+        return self.state / "vectors.sqlite"
+
+    @property
+    def labels(self) -> Path:
+        return self.state / "labels"
+
+    @property
     def config(self) -> Path:
         return self.state / "config.json"
 
@@ -86,6 +96,12 @@ DEFAULT_CONFIG = {
     "exa_agent_effort": "medium",  # minimal|low|medium|high|xhigh (fixed price per run) | auto|ultra (metered, capped below)
     "exa_agent_max_cost": 5,  # USD ceiling, only used by auto/ultra
     "exa_agent_timeout_s": 900,
+    # Local embeddings for hybrid lobby/RAG search (ONNX, runs offline after a one-time download).
+    # "none" = lexical only. HOTEL_EMBEDDER overrides.
+    "embedder": "fastembed:google/embeddinggemma-300m",
+    # Mercury Edit ghost text in the composer (needs INCEPTION_API_KEY and the training opt-out).
+    "suggest": True,
+    "suggest_context": 4,  # lobby/RAG snippets sent with each suggestion request
     "default_room": "inbox",
     "theme": "calculus-dark",
 }

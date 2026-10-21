@@ -44,14 +44,13 @@ class _ShadowHotel:
     """Just enough of Hotel for build_context: the reg and an FTS over the replay lobby."""
 
     def __init__(self, hotel, text):
+        from pathlib import Path
+
         from .derived import Derived
-        import sqlite3
         self.reg = hotel.reg
         self.blobs = hotel.blobs
         self.cfg = hotel.cfg
-        self.derived = Derived.__new__(Derived)
-        self.derived.conn = sqlite3.connect(":memory:")
-        self.derived.conn.row_factory = sqlite3.Row
+        self.derived = Derived(Path(":memory:"))  # lexical only: replay stays deterministic
         self.set_text(text)
 
     def set_text(self, text):

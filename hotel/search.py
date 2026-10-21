@@ -39,6 +39,7 @@ class Hit:
     flag: str  # external | own | secondhand
     published: str | None = None
     query: str | None = None
+    signals: dict | None = None  # local ranks (bm25/dense/rrf); kept in the raw blob as retrieval labels
 
     @property
     def snippet(self) -> str:
@@ -255,12 +256,14 @@ def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
 
     def rag_hits(query: str) -> list[Hit]:
         now = utcnow()
-        return [Hit("rag", f"RAG:{d['id']}", d["title"] or "", d["source"], d["text"], now, "external")
+        return [Hit("rag", d["ref"], " > ".join(x for x in (d["title"], d["heading"]) if x), d["source"], d["body"],
+                    now, "external", query=query, signals=d["signals"])
                 for d in rag.search(query, 5)]
 
     def lobby_hits(query: str) -> list[Hit]:
         now = utcnow()
-        return [Hit("lobby", r["eid"], f"{r['type']} in {r['room']} [{r['status']}]", None, r["body"], now, "own")
+        return [Hit("lobby", r["eid"], f"{r['type']} in {r['room']} [{r['status']}]", None, r["body"], now, "own",
+                    signals=r.get("signals"))
                 for r in derived.search(query, 8)]
 
     def lobby_search(query: str) -> ToolResult:
@@ -307,7 +310,7 @@ def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
         rag_h = [h for q in queries for h in rag_hits(q)][:agent_num_results]
         hits, skipped, seen = [], [], set()
         for h in rag_h + web:
-            key = h.url or h.id
+            key = h.id if h.source == "rag" else (h.url or h.id)  # chunks of one file are distinct
             if key in skip:
                 skipped.append(key)
                 continue

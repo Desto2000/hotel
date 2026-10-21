@@ -524,6 +524,9 @@ class HotelApp(App):
         self.guest_log = Text()
         self.agent_lock = threading.Lock()
         self.positions: dict[str, int] = {}
+        self.last_edit: int | None = None  # Reg id of the lobby_edit a plain line produced
+        from .suggest import NextEdit
+        self.suggester = NextEdit(hotel, lambda: self.room)
         for p in self.pals.values():  # must exist before the stylesheet is parsed
             self.register_theme(textual_theme(p))
         self.theme = self.pal_name
@@ -556,7 +559,7 @@ class HotelApp(App):
                         with VerticalScroll(classes="pane-scroll"):
                             yield Static(id="blob")
         yield Static(id="msg")
-        yield Input(placeholder="write a thought, or /help", id="cmd")
+        yield Input(placeholder="write a thought, or /help", id="cmd", suggester=self.suggester)
         yield Footer()
 
     def on_mount(self):
@@ -572,6 +575,8 @@ class HotelApp(App):
             self.say("welcome. /help for commands. plain text is a monologue in [b]" + self.room + "[/b].")
         self.refresh_all()
         self.query_one("#cmd", Input).focus()
+        if self.hotel.index is not None and not self.is_headless:
+            self.hotel.index.warm_in_background()  # load (or first-time download) the embedder off the UI thread
         if (not self.is_headless and not keys.onboarded()) if self.onboard is None else self.onboard:
             self.action_setup()
         elif (not self.is_headless) if self.splash is None else self.splash:
@@ -767,6 +772,7 @@ class HotelApp(App):
             "talk" if self.guest_mode and line.startswith(">") else "monologue")
         events = self.hotel.events
         events.emit("command", name=name, room=self.room)
+        self.last_edit = None
         try:
             self.dispatch(line)
         except GateBlocked as ex:
@@ -777,6 +783,7 @@ class HotelApp(App):
         except (OpError, ValueError) as ex:
             events.emit("rejected", name=name, error=str(ex)[:300])
             self.say(str(ex), "error")
+        self.suggester.submitted(line, self.last_edit)
         self.refresh_all()
 
     def action_focus_cmd(self):
@@ -821,7 +828,7 @@ class HotelApp(App):
                 self.say("guest thinking…")
                 return self.run_guest(line[1:].strip(), None)
             res = h.apply([AppendOp(op="append", room=self.room, type="monologue", body=line, refs=[], tags=[])])
-            self.focus_id = res.created[0]
+            self.focus_id, self.last_edit = res.created[0], res.reg_id
             if self.guest_mode:
                 if h.gateway.pending():
                     raise GateBlocked(h.gateway.pending())

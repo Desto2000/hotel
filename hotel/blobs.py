@@ -25,6 +25,10 @@ class BlobStore:
             os.replace(tmp, p)
         return h
 
+    @staticmethod
+    def hash_text(s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
     def put_text(self, s: str) -> str:
         return self.put(s.encode("utf-8"))
 

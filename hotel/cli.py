@@ -155,7 +155,13 @@ def _main(argv=None):
     s = sub.add_parser("reg"); s.add_argument("--limit", type=int, default=30)
     s = sub.add_parser("replay"); s.add_argument("session"); s.add_argument("--librarian", default="rule")
     s.add_argument("--approve-queued", action="store_true")
-    s = sub.add_parser("rag-import"); s.add_argument("file"); s.add_argument("--title")
+    s = sub.add_parser("rag", help="RAG store: import files/dirs (md, txt, html, pdf), list, forget")
+    s.add_argument("action", choices=["import", "list", "forget"])
+    s.add_argument("args", nargs="*", help="import: files or directories; forget: RAG id")
+    s.add_argument("--title"); s.add_argument("--reason")
+    s = sub.add_parser("rag-import", help="same as `hotel rag import`"); s.add_argument("file"); s.add_argument("--title")
+    s = sub.add_parser("labels", help="Concierge training/eval data mined from the Reg, with retrieval quality")
+    s.add_argument("--export", action="store_true", help="write .hotel/labels/*.jsonl + manifest.json")
     sub.add_parser("sessions")
     s = sub.add_parser("research", help="run the research agent on a bounty"); s.add_argument("entry")
     s.add_argument("--llm", help="router profile (default: config llm)"); s.add_argument("--max-searches", type=int)
@@ -398,11 +404,34 @@ def _main(argv=None):
         print(t.reply or "(no reply) " + "; ".join(t.log[-2:]))
         if t.proposals:
             print("drafts in review: " + " ".join(f"R:{p}" for p in t.proposals) + "  (hotel review approve <id>)")
-    elif a.cmd == "rag-import":
-        text = Path(a.file).read_text(encoding="utf-8")
-        rid = h.rag.add("import", str(Path(a.file).resolve()), a.title or Path(a.file).name, text)
-        h.gateway.log("internal", "user", tool="rag.import", payload={"rag_id": rid, "file": a.file})
-        print(f"RAG:{rid}")
+    elif a.cmd == "rag-import" or (a.cmd == "rag" and a.action == "import"):
+        files = [Path(a.file)] if a.cmd == "rag-import" else [Path(x) for x in a.args]
+        if not files:
+            sys.exit("hotel rag import <file or directory>...")
+        res = h.rag_import(files, a.title, progress=lambda f, did, new: print(
+            f"RAG:{did:<5} {'new ' if new else 'same'} {len(h.rag.chunks(did)):>4} chunks  {f}"))
+        if h.index is not None:
+            print(f"embedded with {h.index.name}" if not h.index.error else f"embeddings unavailable: {h.index.error}")
+        if not res:
+            print("nothing importable (md, markdown, txt, rst, org, html, htm, pdf)")
+    elif a.cmd == "rag" and a.action == "list":
+        for d in h.rag.docs():
+            state = f"forgotten {d['forgotten_at']}" if d["forgotten_at"] else f"{d['n_chunks']:>4} chunks {d['chars']:>8} chars"
+            print(f"RAG:{d['id']:<5} {d['kind']:<9} {state}  {d['title'] or ''}")
+    elif a.cmd == "rag" and a.action == "forget":
+        if len(a.args) != 1 or not a.reason:
+            sys.exit("hotel rag forget <id> --reason <why>")
+        info = h.forget_rag(int(a.args[0].removeprefix("RAG:")), a.reason)
+        print(f"forgot RAG:{a.args[0].removeprefix('RAG:')}: text blob {'deleted' if info['deleted'] else 'already gone'}, "
+              f"{info['chunks']} chunks unindexed; the id stays so references still resolve")
+    elif a.cmd == "labels":
+        from .concierge import labels
+        if a.export:
+            info = labels.export(h)
+        else:
+            lab = labels.mine(h)
+            info = {"reg_head": lab.reg_head, "counts": lab.counts(), "stats": labels.retrieval_stats(lab)}
+        print(json.dumps(info, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

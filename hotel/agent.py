@@ -21,6 +21,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from .concierge.pointer import best_spans
 from .gateway import AnnotationRejected, GateBlocked, find_quote, make_pointer
 from .llm import LLM
 from .models import Annotation, Claim
@@ -125,7 +126,11 @@ def model_annotate(hotel, args: dict, actor: str, verifier_transport=None):
     for i, c in enumerate(args.get("claims") or [], 1):
         ptr = make_pointer(text, entry.text_hash, str(c.get("quote", "")))
         if ptr is None:
-            errs.append(f"claim {i}: quote is not contiguous text from R:{entry.id}. {quote_hint(text, str(c.get('quote', '')))}")
+            hint = quote_hint(text, str(c.get('quote', '')))
+            near = best_spans(str(c.get("text", "")), text, hotel.index.embedder if hotel.index else None, 1)
+            if near:
+                hint += f" Closest source sentence to your claim: {text[near[0][0]:near[0][1]]!r}"
+            errs.append(f"claim {i}: quote is not contiguous text from R:{entry.id}. {hint}")
             continue
         try:
             claims.append(Claim(text=str(c.get("text", "")).strip() or "(empty)", pointer=ptr,

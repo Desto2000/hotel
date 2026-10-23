@@ -175,3 +175,58 @@ def test_theme_builds():
     t = textual_theme(pals["calculus-dark"])
     assert t.primary.upper() == "#2B83FF" and t.background.upper() == "#000000"
     assert lobby_styles(pals["calculus-light"])["type"].color
+
+
+def test_claim_refs_and_suggested_links_go_to_review(hotel):
+    from hotel.llm import ScriptedTransport
+    import json as _json
+    b = add(hotel, "harness", "bounty", "Does Exa support a date filter?")
+    other = add(hotel, "harness", "idea", "Filter search results by publication date")
+    e, _ = hotel.gateway.call("fake.search", query="exa date")
+    annotate_supporting(hotel, e.id, b)
+    tr = ScriptedTransport([lambda body: {"content": _json.dumps({"links": [
+        {"claim": 1, "entry": other, "why": "same filter"},
+        {"claim": 1, "entry": "L9999", "why": "invented"},   # not a candidate: dropped
+        {"claim": 7, "entry": other, "why": "no such claim"},  # invented claim: dropped
+    ]})}])
+    _, results = run_librarian(hotel, e.id, related_transport=tr)
+    lob = hotel.lobby()
+    assert f"R:{e.id}#c1" in lob.entries[b].metas("ref")  # named by the user: applied, as a claim ref
+    assert lob.entries[other].metas("ref") == []  # inferred by the model: not applied
+    (rv,) = hotel.reg.pending_reviews()
+    assert rv.payload["op"] == {"op": "ref", "id": other, "ref": f"R:{e.id}#c1"}
+    assert hotel.decide(rv.id, True).route == "applied"
+    assert f"R:{e.id}#c1" in hotel.lobby().entries[other].metas("ref")
+    assert "Exa has a date filter" in hotel.read_entries([other])  # readers get the claim, not the whole search
+    assert hotel.check() == []
+
+
+def test_reading_view_folds_but_never_changes_content(hotel):
+    from hotel import reading
+    from hotel.llm import ScriptedTransport
+    from hotel.theme import lobby_styles, palettes
+    doc_text = ("QUERY: q\n\n### [1] fake:1 (external) Doc\n\nDoc\n\nSign in\n\n"
+                "## Results\n\nExa supports a **startPublishedDate** filter.\n\nFollow the steps below.\n")
+    hotel.gateway.register(ToolSpec("fake.page", "retrieval", "fake", lambda query: ToolResult(b"{}", doc_text, [], "fake")))
+    e, _ = hotel.gateway.call("fake.page", query="q")
+    doc = reading.parse(hotel.blobs.text(e.text_hash))
+    lines = {doc.line_text(n).strip(): n for n in range(len(doc.lines))}
+    assert {lines["Doc"], lines["Sign in"]} <= reading.rule_chrome(doc)
+    # the model may only name candidate line numbers; anything else is ignored
+    tr = ScriptedTransport([lambda body: {"content": '{"chrome": [%d, 0, 2, 9999]}' % lines["Follow the steps below."]}])
+    got = reading.model_chrome(hotel, e.id, "groq", transport=tr)
+    assert got == {lines["Follow the steps below."]}
+    assert hotel.blobs.text(e.text_hash) == doc_text  # stored text untouched
+    chrome, _ = reading.chrome_for(hotel, e.id, doc)
+    st = lobby_styles(palettes()["calculus-dark"])
+    view = reading.render(doc, st, chrome).plain
+    assert "Sign in" not in view and "Follow the steps" not in view
+    assert "Exa supports a startPublishedDate filter." in view  # marks hidden, words kept
+    assert "Sign in" in reading.render(doc, st, chrome, show_all=True).plain
+    # forum usernames stay: they show who is speaking
+    forum = reading.parse("QUERY: q\n\n### [1] exa:1 (external) Thread\n\nalice\n\nForgetting is harder.\n\n"
+                          "Edit 2022-06-20 20:21\n\nbob\n\nLoving is harder, for me at least.\n")
+    kept = {forum.line_text(n) for n in range(len(forum.lines))} - {forum.line_text(n) for n in reading.rule_chrome(forum)}
+    assert {"alice", "bob"} <= kept and "Edit 2022-06-20 20:21" not in kept
+    # text copied from the view still quotes against the stored blob
+    assert make_pointer(doc_text, e.text_hash, "Results Exa supports a startPublishedDate filter.") is not None

@@ -102,6 +102,13 @@ DEFAULT_CONFIG = {
     # Mercury Edit ghost text in the composer (needs INCEPTION_API_KEY and the training opt-out).
     "suggest": True,
     "suggest_context": 4,  # lobby/RAG snippets sent with each suggestion request
+    # Reading view of search results: fold page chrome (menus, buttons, bylines) without touching the
+    # stored text. "model" = a rule plus the default llm profile (line numbers only), "rule" = offline,
+    # "off" = no chrome folding, or a profile name.
+    "reading_filter": "model",
+    # After filing an annotation, ask the default llm profile which other entries a claim is relevant
+    # to; each suggestion is a claim ref waiting in Review. "off" disables it; a profile name picks one.
+    "related_refs": "model",
     "default_room": "inbox",
     "theme": "calculus-dark",
 }

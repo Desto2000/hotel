@@ -50,7 +50,9 @@ def building(st: dict, top: int = 0, street_k: int = len(BUILDING[-1]), lit: set
 SIG_STYLE = {" ": "sig_open", "x": "sig_closed", "~": "sig_superseded", "!": "sig_contested", ".": "sig_static"}
 
 
-def highlight_lobby(text: str, st: dict, focus: str | None = None, gutter: bool = True) -> tuple[Text, dict[str, int]]:
+def highlight_lobby(text: str, st: dict, focus: str | None = None, gutter: bool = True,
+                    notes: dict[str, str] | None = None) -> tuple[Text, dict[str, int]]:
+    """notes: meta value -> a short note shown after it (a claim ref's claim, say)."""
     out = Text(no_wrap=True, overflow="ellipsis")
     lines = text.split("\n")
     if lines and lines[-1] == "":
@@ -94,6 +96,8 @@ def highlight_lobby(text: str, st: dict, focus: str | None = None, gutter: bool 
             row.append(": ", st["pipe"])
             vs = {"tag": "meta_tag", "note": "meta_note"}.get(k, "meta_ref")
             row.append(v, st["dead"] if dead else st[vs])
+            if notes and v in notes:
+                row.append("  " + notes[v], st["dead"] if dead else st["meta_note"])
         elif line == HEADER:
             row.append(line, st["header"])
         else:

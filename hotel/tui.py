@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import shlex
 import threading
 from pathlib import Path
@@ -23,9 +24,9 @@ from textual.widgets import (
     Button, DataTable, Footer, Input, Label, Select, Static, TabbedContent, TabPane, Tree,
 )
 
-from . import keys
+from . import keys, reading
 from .core import Hotel, ValidationFailed
-from .gateway import AnnotationRejected, GateBlocked, make_pointer
+from .gateway import AnnotationRejected, GateBlocked, load_annotation, make_pointer
 from .grammar import SIGIL_NAMES
 from .librarian import run_librarian
 from .models import (
@@ -49,7 +50,7 @@ HELP = r"""[b]write[/b]   plain text → monologue in current room · /bounty /g
 [b]agent[/b]   /research L#### (one bounty per run) · /accept R:n keep an answer as an approved entry
 [b]house[/b]   /move L <room> \[why] · /custodian (flag stale closed bounties) · /backup \[dir]
 [b]resident[/b] /lib \[R:n] run librarian · /approve R:n · /reject R:n
-[b]inspect[/b] /blob R:n · /check · /verify · /theme (ctrl+t) · /setup (keys, privacy, theme) · /q"""
+[b]inspect[/b] /blob R:n\[#ck] \[all|raw] (a claim: just its section, quote highlighted) · /check · /verify · /theme (ctrl+t) · /setup (keys, privacy, theme) · /q"""
 
 
 # ======================================================================== opening
@@ -359,20 +360,23 @@ class OnboardingScreen(Screen):
 
 # ======================================================================== modal
 class AnnotateScreen(ModalScreen):
-    BINDINGS = [Binding("escape", "cancel", "cancel")]
+    BINDINGS = [Binding("escape", "cancel", "cancel"),
+                Binding("ctrl+o", "toggle_folds", "show/hide folded", priority=True)]
 
     def __init__(self, hotel: Hotel, rid: int, styles: dict):
         super().__init__()
         self.hotel, self.rid, self.st = hotel, rid, styles
         self.entry = hotel.reg.get(rid)
         self.text = hotel.blobs.text(self.entry.text_hash)
+        self.doc = reading.parse(self.text)
+        self.show_all = False
         self.claims: list[Claim] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="ann"):
             with VerticalScroll(id="ann-blob") as vs:
                 vs.border_title = f"R:{self.rid} · {self.entry.tool} · {self.entry.provider} · text {self.entry.text_hash[:10]}"
-                yield Static(Text(self.text), id="ann-text")
+                yield Static(id="ann-text")
             with Vertical(id="ann-form") as f:
                 f.border_title = "annotation"
                 yield Label("claim (your words)")
@@ -393,6 +397,25 @@ class AnnotateScreen(ModalScreen):
                     yield Button("nothing useful", id="a-nothing")
                     yield Button("cancel", id="a-cancel", variant="error")
                 yield Static("", id="a-err")
+
+    def on_mount(self):
+        self.refresh_view()
+
+    def refresh_view(self):
+        """The reading view of the stored text: chrome and long code folded, quotes of the
+        claims added so far highlighted. The text itself is never changed."""
+        chrome, by = reading.chrome_for(self.hotel, self.rid, self.doc)
+        n = len({k for f in reading.folds(self.doc, chrome) for k in range(f.first, f.last + 1)
+                 if self.doc.lines[k].kind == "body"})
+        hl = [(c.pointer.start, c.pointer.end, self.st["match"]) for c in self.claims]
+        self.query_one("#ann-text", Static).update(
+            reading.render(self.doc, self.st, chrome, show_all=self.show_all, highlights=hl))
+        self.query_one("#ann-blob").border_subtitle = (
+            f"{n} lines folded ({by}) · ctrl+o {'folds them' if self.show_all else 'shows them'}" if n else "")
+
+    def action_toggle_folds(self):
+        self.show_all = not self.show_all
+        self.refresh_view()
 
     def _err(self, msg: str):
         self.query_one("#a-err", Static).update(Text(msg, self.st["error"]))
@@ -428,6 +451,7 @@ class AnnotateScreen(ModalScreen):
             self.query_one(i, Input).value = ""
         self._err("")
         self._render_claims()
+        self.refresh_view()
 
     def _submit(self, caused: str, caused_refs: list[str]):
         try:
@@ -525,6 +549,8 @@ class HotelApp(App):
         self.agent_lock = threading.Lock()
         self.positions: dict[str, int] = {}
         self.last_edit: int | None = None  # Reg id of the lobby_edit a plain line produced
+        self.results_rid: int | None = None  # retrieval shown in the Results tab
+        self.blob_view: tuple | None = None  # (rid, claim, mode) shown in the Blob tab
         from .suggest import NextEdit
         self.suggester = NextEdit(hotel, lambda: self.room)
         for p in self.pals.values():  # must exist before the stylesheet is parsed
@@ -642,7 +668,9 @@ class HotelApp(App):
         self.query_one("#status", Static).update(t)
 
     def render_lobby(self):
-        text, self.positions = highlight_lobby(self.hotel.text(), self.st, self.focus_id)
+        raw = self.hotel.text()
+        notes = {r: n for r in set(re.findall(r"\+ ref: (R:\d+#c\d+)", raw)) if (n := self.hotel.claim_text(r))}
+        text, self.positions = highlight_lobby(raw, self.st, self.focus_id, notes=notes)
         self.query_one("#lobby", Static).update(text)
 
     def render_dir(self):
@@ -703,44 +731,112 @@ class HotelApp(App):
         items = self.hotel.reg.pending_reviews()
         if not items:
             t.append("review queue empty", st["muted"])
+        lob = None
         for r in items:
             t.append(f"{r.rid} ", st["number"])
             t.append(f"by {r.actor} ", st["muted"])
             t.append(f"(cause R:{r.ref_id})\n" if r.ref_id else "\n", st["muted"])
-            t.append(json.dumps(r.payload["op"], ensure_ascii=False, indent=1) + "\n", st["string"])
+            op = r.payload["op"]
+            note = self.hotel.claim_text(op["ref"]) if op.get("op") == "ref" else None
+            if note:  # a suggested link: show what would be linked to what
+                lob = lob or self.hotel.lobby()
+                e = lob.entries.get(op["id"])
+                t.append("link ", st["muted"])
+                t.append(op["id"], st["id"])
+                t.append(f" ({e.type}) {' '.join(e.text.split())[:140]}\n" if e else "\n", st["body"])
+                t.append("  to ", st["muted"])
+                t.append(op["ref"] + " ", st["meta_ref"])
+                t.append(note + "\n", st["string"])
+                t.append(f"  /blob {op['ref']} shows the section\n", st["muted"])
+            else:
+                t.append(json.dumps(op, ensure_ascii=False, indent=1) + "\n", st["string"])
             t.append(f"reason: {r.payload['reason']}\n", st["meta_note"])
             t.append(f"/approve {r.rid}   /reject {r.rid}\n\n", st["accent"])
         self.query_one("#review", Static).update(t)
 
-    def render_results(self, hits, query, rid):
+    def render_results(self, rid: int, switch: bool = True):
+        """Each hit's header and the start of its real content (from the stored blob, chrome skipped)."""
         st = self.st
+        h = self.hotel
+        e = h.reg.get(rid)
+        doc = reading.parse(h.blobs.text(e.text_hash))
+        chrome, by = reading.chrome_for(h, rid, doc)
+        query = next((doc.line_text(ln.n)[7:] for ln in doc.lines if ln.kind == "top"
+                      and doc.line_text(ln.n).startswith("QUERY: ")), "")
         t = Text()
-        t.append(f"{rid}  ", st["number"])
-        t.append(query + "\n\n", st["room_name"])
-        for n, h in enumerate(hits, 1):
-            t.append(f"[{n}] ", st["number"])
-            t.append(f"{h.source}", st["function"])
-            flag_st = {"external": "warning", "own": "created", "secondhand": "hint"}[h.flag]
-            t.append(f" {h.flag} ", st[flag_st])
-            t.append((h.title or h.id) + "\n", st["body"])
-            if h.url:
-                t.append(f"    {h.url}\n", st["meta_ref"])
-            t.append(f"    {h.snippet}\n\n", st["muted"])
-        if not hits:
-            t.append("no results\n", st["muted"])
+        t.append(f"R:{rid}  ", st["number"])
+        t.append(query + "\n", st["room_name"])
+        t.append(f"page chrome skipped ({by}) · /blob R:{rid} reads it all\n\n", st["muted"])
+        t.append(reading.preview(doc, st, chrome))
+        self.results_rid = rid
         self.query_one("#results", Static).update(t)
-        self.query_one(TabbedContent).active = "t-res"
+        if switch:
+            self.query_one(TabbedContent).active = "t-res"
 
-    def show_blob(self, rid: int):
-        e = self.hotel.reg.get(rid)
+    def show_blob(self, rid: int, claim: int | None = None, mode: str = "", switch: bool = True):
+        """mode "" = reading view, "all" = nothing folded, "raw" = the stored text as is.
+        With a claim: only the result its quote is in, the quote highlighted."""
+        h, st = self.hotel, self.st
+        e = h.reg.get(rid)
         if not e or not e.text_hash:
             return self.say(f"R:{rid} has no text blob", "error")
         try:
-            body = Text(self.hotel.blobs.text(e.text_hash), self.st["body"])
+            text = h.blobs.text(e.text_hash)
         except FileNotFoundError:
-            body = Text(f"R:{rid}: content forgotten (see the redaction row in the Reg)", self.st["muted"])
+            self.query_one("#blob", Static).update(
+                Text(f"R:{rid}: content forgotten (see the redaction row in the Reg)", st["muted"]))
+            self.query_one(TabbedContent).active = "t-blob"
+            return
+        self.blob_view = (rid, claim, mode)
+        if mode == "raw":
+            body = Text(text, st["body"])
+        else:
+            doc = reading.parse(text)
+            chrome, _ = reading.chrome_for(h, rid, doc)
+            ann = load_annotation(h.reg.annotation_for(rid), h.blobs) if e.kind == "retrieval" else None
+            claims = ann["claims"] if ann else []
+            hl = [(c["pointer"]["start"], c["pointer"]["end"], st["match"]) for c in claims]
+            body, only = Text(), None
+            if claim is not None:
+                if not 1 <= claim <= len(claims):
+                    return self.say(f"R:{rid} has no claim c{claim}", "error")
+                c = claims[claim - 1]
+                only = doc.hit_at(c["pointer"]["start"]) or None
+                hl = [(c["pointer"]["start"], c["pointer"]["end"], st["selection"])]
+                body.append(f"R:{rid}#c{claim} ", st["meta_ref"])
+                body.append(f"[{c['relation']}] ", st["type"])
+                body.append(c["text"] + "\n", st["room_name"])
+                body.append(f"/blob R:{rid} shows the whole retrieval\n\n", st["muted"])
+            body.append(reading.render(doc, st, chrome, show_all=mode == "all", highlights=hl, only_hit=only))
         self.query_one("#blob", Static).update(body)
-        self.query_one(TabbedContent).active = "t-blob"
+        if switch:
+            self.query_one(TabbedContent).active = "t-blob"
+
+    @work(thread=True, group="reader")
+    def refine_view(self, rid: int):
+        """Let the model fold the chrome the rule missed, then redraw whatever shows this retrieval."""
+        h = self.hotel
+        if not reading.needs_model(h, rid):
+            return
+        try:
+            lines = reading.model_chrome(h, rid, reading.model_profile(h.cfg) or None)
+        except Exception as ex:
+            h.events.emit("error", where="reader", error=f"{type(ex).__name__}: {ex}"[:300])
+            self.call_from_thread(self.say, f"reading view: model filter failed, rule only ({ex})"[:200], "warning")
+            return
+
+        def ui():
+            if self.results_rid == rid:
+                self.render_results(rid, switch=False)
+            if self.blob_view and self.blob_view[0] == rid:
+                self.show_blob(*self.blob_view, switch=False)
+            for s in self.screen_stack:
+                if isinstance(s, AnnotateScreen) and s.rid == rid:
+                    s.refresh_view()
+            self.render_reg()
+            if lines:
+                self.say(f"R:{rid}: the model marked {len(lines)} lines as page chrome (folded, not deleted)", "hint")
+        self.call_from_thread(ui)
 
     # ------------------------------------------------------------- events
     @on(Tree.NodeSelected, "#dir")
@@ -813,6 +909,7 @@ class HotelApp(App):
             self.refresh_all()
 
         self.push_screen(AnnotateScreen(self.hotel, rid, self.st), done)
+        self.refine_view(rid)  # retrievals from other front ends (mcp, agents) get a reading view too
 
     def action_librarian(self):
         self.librarian_on(None)
@@ -899,7 +996,7 @@ class HotelApp(App):
             return self.run_search(tool, rest)
         if cmd == "ls":
             e, res = h.gateway.call("lobby.search", actor="user", query=rest)
-            return self.render_results(res.data, rest, e.rid)
+            return self.render_results(e.id)
         if cmd == "annotate":
             rid = int(args[0].removeprefix("R:")) if args else None
             return self.action_annotate(rid)
@@ -952,7 +1049,10 @@ class HotelApp(App):
             r = h.decide(int(args[0].removeprefix("R:")), cmd == "approve")
             return self.say(f"{cmd}: {r.route} — {r.reason} {r.detail}", "created" if r.route == "applied" else "warning")
         if cmd == "blob":
-            return self.show_blob(int(args[0].removeprefix("R:")))
+            m = re.match(r"^(?:R:)?(\d+)(?:#c(\d+))?$", args[0] if args else "")
+            if not m or (args[1:] and args[1] not in ("all", "raw")):
+                raise ValueError("/blob R:n[#ck] [all|raw]")
+            return self.show_blob(int(m.group(1)), int(m.group(2)) if m.group(2) else None, args[1] if args[1:] else "")
         if cmd == "check":
             errs = h.check()
             return self.say("lobby valid ✓" if not errs else "\n".join(errs[:8]), "success" if not errs else "error")
@@ -978,10 +1078,11 @@ class HotelApp(App):
             return
 
         def ui():
-            self.render_results(res.data, query, entry.rid)
+            self.render_results(entry.id)
             self.say(f"{entry.rid} stored ({len(res.data)} hits, text {entry.text_hash[:10]}). "
                      f"gate locked — ctrl+a to annotate.", "warning")
             self.refresh_all()
+            self.refine_view(entry.id)
         self.call_from_thread(ui)
 
     @work(thread=True, group="agent")

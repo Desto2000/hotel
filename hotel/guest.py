@@ -151,10 +151,7 @@ class Guest:
                 return res.text
             if name == "read_entry":
                 gw._gate("read_entry", "guest", "internal", force=True)
-                lob = self.h.lobby()
-                blocks = ["\n".join(lob.lines[e.start:e.end + 1]) for i in args.get("ids") or []
-                          if (e := lob.entries.get(str(i)))]
-                return "\n\n".join(blocks) or "no such entries"
+                return self.h.read_entries(args.get("ids") or [])
             if name == "search":
                 qs, rejected = clean_queries(args.get("queries") or [], self.seen_q, 3)
                 if not qs:

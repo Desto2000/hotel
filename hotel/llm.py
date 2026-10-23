@@ -29,7 +29,7 @@ DEFAULT_PROFILES = {
         "model": "mercury-3",
         "key_env": "INCEPTION_API_KEY",
         # Inception's own vocabulary: instant | low | medium | high
-        "effort": {"agent": "low", "librarian": "low"},
+        "effort": {"agent": "low", "librarian": "low", "reader": "instant"},
         "require_training_optout": True,
     },
     "groq": {
@@ -37,7 +37,7 @@ DEFAULT_PROFILES = {
         "model": "openai/gpt-oss-120b",
         "key_env": "GROQ_API_KEY",
         "key_env_fallback": "HERMES_CUSTOM_GROQ_API_KEY",
-        "effort": {"agent": "low", "librarian": "low"},
+        "effort": {"agent": "low", "librarian": "low", "reader": "low"},
         "require_training_optout": False,
     },
 }
@@ -85,11 +85,25 @@ def get_profile(cfg: dict, name: str | None = None) -> Profile:
                    key_env_fallback=p.get("key_env_fallback"), price=p.get("price"))
 
 
-def http_chat(profile: Profile, cfg: dict, body: dict) -> bytes:
-    if profile.require_training_optout and not (
+def _optout_ok(profile: Profile, cfg: dict) -> bool:
+    return not profile.require_training_optout or bool(
         cfg.get("inception_training_opt_out_confirmed")
-        or os.environ.get("HOTEL_INCEPTION_TRAINING_OPTOUT") == "confirmed"
-    ):
+        or os.environ.get("HOTEL_INCEPTION_TRAINING_OPTOUT") == "confirmed")
+
+
+def unavailable(cfg: dict, name: str | None = None) -> str | None:
+    """Why a profile cannot be called right now (no key, training opt-out not confirmed), or None.
+    Optional model features check this first and quietly fall back instead of logging a failure."""
+    try:
+        p = get_profile(cfg, name)
+        p.key()
+    except LLMError as ex:
+        return str(ex)
+    return None if _optout_ok(p, cfg) else "training opt-out not confirmed (/setup)"
+
+
+def http_chat(profile: Profile, cfg: dict, body: dict) -> bytes:
+    if not _optout_ok(profile, cfg):
         raise LLMError(
             "refusing to send lobby content: turn off the API training opt-in in the provider dashboard, "
             "then set inception_training_opt_out_confirmed=true in .hotel/config.json"

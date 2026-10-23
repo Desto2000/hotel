@@ -102,9 +102,7 @@ def build_server(hotel) -> MCPServer:
     def read_entries(ids: list[str]) -> str:
         with lock:
             read("read_entries", ids=ids)
-            lob = hotel.lobby()
-            blocks = ["\n".join(lob.lines[e.start:e.end + 1]) for i in ids if (e := lob.entries.get(i))]
-            return "\n\n".join(blocks) or "no such entries"
+            return hotel.read_entries(ids)
 
     @mcp.tool(description="Web (+ imported RAG) search with 1-3 distinct queries. "
                           "Returns retrieval R:<n>; annotate it before any other call.")

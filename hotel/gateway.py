@@ -149,6 +149,21 @@ def load_annotation(row: RegEntry | None, blobs: BlobStore) -> dict | None:
     return row.payload if "claims" in row.payload else None
 
 
+CLAIM_REF = re.compile(r"^R:(\d+)#c(\d+)$")
+
+
+def claim_ref(ref: str, reg: Reg, blobs: BlobStore) -> tuple[int, int, dict | None] | None:
+    """`R:<n>#c<k>` -> (n, k, claim k of R:n's annotation). The claim is None when the
+    annotation is missing, forgotten or has no claim k; None for any other kind of ref."""
+    m = CLAIM_REF.match(ref)
+    if not m:
+        return None
+    rid, k = int(m.group(1)), int(m.group(2))
+    ann = load_annotation(reg.annotation_for(rid), blobs)
+    claims = ann["claims"] if ann else []
+    return rid, k, claims[k - 1] if 1 <= k <= len(claims) else None
+
+
 def load_args(row: RegEntry, blobs: BlobStore) -> dict | None:
     p = row.payload or {}
     if "args_blob" in p:
@@ -204,28 +219,58 @@ def validate_annotation(ann: Annotation, reg: Reg, blobs: BlobStore, lobby_ids: 
     return errs
 
 
+MARKS = set("*_`#")  # markdown marks: models drop them when quoting, the reading view hides them
+
+
+def _project(s: str) -> tuple[str, list[int]]:
+    """s without markdown marks and with whitespace runs collapsed to one space,
+    plus the index in s of every character kept."""
+    out, idx, space = [], [], False
+    for i, ch in enumerate(s):
+        if ch in MARKS:
+            continue
+        if ch.isspace():
+            space = bool(out)
+            continue
+        if space:
+            out.append(" ")
+            idx.append(i - 1)
+            space = False
+        out.append(ch)
+        idx.append(i)
+    return "".join(out), idx
+
+
 def find_quote(text: str, quote: str) -> tuple[int, int] | None:
     """Locate quote in the stored text: exact, then whitespace-insensitive, then
-    tolerant of markdown emphasis (models drop `**bold**` / `_x_` / `code` marks
-    when quoting). Always returns the span of the *stored* text, so the pointer's
-    quote is exact and re-verifiable."""
+    ignoring markdown marks (`**bold**`, `code`, `## heading`) on both sides.
+    Always returns the span of the *stored* text, so the pointer's quote is
+    exact and re-verifiable."""
     quote = quote.strip()
     if not quote:
         return None
     i = text.find(quote)
     if i >= 0:
         return i, i + len(quote)
-    words = quote.split()
-    pat = r"\s+".join(re.escape(w) for w in words)
+    pat = r"\s+".join(re.escape(w) for w in quote.split())
     m = re.search(pat, text) or re.search(pat, text, flags=re.IGNORECASE)
-    if not m:
-        toks = [w.strip("*_`") for w in words]
-        toks = [t for t in toks if t]
-        if toks:
-            mk = r"[*_`]*"
-            pat = mk + (mk + r"\s+" + mk).join(re.escape(t) for t in toks) + mk
-            m = re.search(pat, text) or re.search(pat, text, flags=re.IGNORECASE)
-    return (m.start(), m.end()) if m else None
+    if m:
+        return m.start(), m.end()
+    q, _ = _project(quote)
+    if not q:
+        return None
+    t, idx = _project(text)
+    j = t.find(q)
+    if j < 0:
+        j = t.lower().find(q.lower())
+    if j < 0:
+        return None
+    s, e = idx[j], idx[j + len(q) - 1] + 1
+    while s > 0 and text[s - 1] in MARKS:  # keep the marks around the quote: `**bold**` stays whole
+        s -= 1
+    while e < len(text) and text[e] in MARKS:
+        e += 1
+    return s, e
 
 
 def make_pointer(text: str, text_hash: str, quote: str) -> Pointer | None:

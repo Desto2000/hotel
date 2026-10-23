@@ -217,6 +217,13 @@ class Reg:
         ).fetchone()
         return RegEntry.from_row(r) if r else None
 
+    def latest(self, kind: str, tool: str, ref_id: int) -> RegEntry | None:
+        r = self.conn.execute(
+            "SELECT * FROM reg WHERE ref_id=? AND kind=? AND tool=? AND status='ok' ORDER BY id DESC LIMIT 1",
+            (ref_id, kind, tool),
+        ).fetchone()
+        return RegEntry.from_row(r) if r else None
+
     def unannotated_retrievals(self) -> list[RegEntry]:
         """Global, not per-session: starting a new session must not escape the gate.
         A forgotten retrieval cannot be annotated any more, so it no longer holds the gate."""

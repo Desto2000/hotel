@@ -16,7 +16,7 @@ from .blobs import BlobStore
 from .config import Paths, load_config, save_config, DEFAULT_CONFIG
 from .derived import Derived
 from .events import EventLog
-from .gateway import Gateway, ToolSpec, load_annotation
+from .gateway import Gateway, ToolSpec, claim_ref, load_annotation
 from .grammar import empty_lobby, parse
 from .locking import atomic_write_text, file_lock
 from .models import (
@@ -147,6 +147,34 @@ class Hotel:
     def lobby(self):
         return parse(self.text())
 
+    def claim_text(self, ref: str) -> str | None:
+        """`R:12#c1` -> '[supports] <claim> — "<quote>"'; None for refs that are not claim refs."""
+        cr = claim_ref(ref, self.reg, self.blobs)
+        if cr is None:
+            return None
+        c = cr[2]
+        if c is None:
+            return f"(claim c{cr[1]} of R:{cr[0]} is gone: forgotten or never recorded)"
+        return f"[{c['relation']}] {c['text']} — \"{' '.join(c['pointer']['quote'].split())[:300]}\""
+
+    def read_entries(self, ids: list[str]) -> str:
+        """Entries as their lobby lines, each claim ref followed by the claim and the quote it
+        points at, so a reader gets the relevant section instead of a whole retrieval."""
+        lob = self.lobby()
+        blocks = []
+        for i in ids:
+            e = lob.entries.get(str(i))
+            if not e:
+                continue
+            out = []
+            for line in lob.lines[e.start:e.end + 1]:
+                out.append(line)
+                k, _, v = line.strip().removeprefix("+ ").partition(": ")
+                if k in ("ref", "closed-by") and (note := self.claim_text(v.strip())):
+                    out.append("      " + note)
+            blocks.append("\n".join(out))
+        return "\n\n".join(blocks) or "no such entries"
+
     def lobby_ids(self) -> set[str]:
         try:
             return set(self.lobby().entries)
@@ -270,7 +298,9 @@ class Hotel:
                 return True, f"annotation of {op.closed_by} has a supporting claim on {op.id}"
         return False, f"no supporting claim on {op.id} in annotation of {op.closed_by}"
 
-    def route_resident_op(self, op, actor: str, cause: int | None) -> RouteResult:
+    def route_resident_op(self, op, actor: str, cause: int | None, review: str | None = None) -> RouteResult:
+        """review: queue the op for the user with this reason even when it is structural
+        (a model's judgment that an entry is relevant, say)."""
         since = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         if self.reg.count_recent("lobby_edit", actor, since) >= self.cfg["resident_rate_cap_per_hour"]:
             return RouteResult(op, "rejected", "rate cap reached")
@@ -282,6 +312,8 @@ class Hotel:
             meaning_changing, reason = (not ok), why
         else:
             reason = "meaning-changing: needs review" if meaning_changing else "structural"
+        if review:
+            meaning_changing, reason = True, review
         if meaning_changing:
             r = self.gateway.log("review", actor, ref_id=cause, payload={"op": op_dump(op), "reason": reason})
             return RouteResult(op, "queued", reason, f"review R:{r.id}")

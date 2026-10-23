@@ -22,6 +22,7 @@ from exa_py import Exa
 from parallel import Parallel
 
 from . import keys
+from .concierge.index import rrf
 from .derived import Derived
 from .gateway import ToolResult
 from .rag import Rag
@@ -190,26 +191,37 @@ class ExaClient:
 
 # ------------------------------------------------------------------ Parallel
 class ParallelClient:
-    """Parallel Search via the `parallel-web` SDK (shape from Inception's cookbook).
-    Untested without PARALLEL_API_KEY."""
+    """Parallel Search via the `parallel-web` SDK (shape from Inception's cookbook)."""
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key
 
-    def search_many(self, queries: list[str], objective: str, num_results: int = 5) -> tuple[bytes, list[Hit]]:
+    def ready(self) -> bool:
+        return bool(self.api_key or keys.get("PARALLEL_API_KEY"))
+
+    def search_many(self, queries: list[str], objective: str, num_results: int = 5,
+                    max_chars: int | None = None) -> tuple[bytes, list[Hit]]:
         key = self.api_key or keys.get("PARALLEL_API_KEY")
         if not key:
             raise RuntimeError("PARALLEL_API_KEY not set — run `hotel setup`")
         client = Parallel(api_key=key, timeout=45, max_retries=0)  # _retry does the backoff
+        extra = {"max_chars_total": max_chars} if max_chars else {}
         raw = _retry(lambda: client.search(
             objective=objective, search_queries=queries, mode="turbo",
-            advanced_settings={"max_results": num_results * len(queries)})).model_dump_json().encode()
+            advanced_settings={"max_results": num_results * len(queries)}, **extra)).model_dump_json().encode()
         now = utcnow()
         hits = [Hit("parallel", it.get("url") or "", it.get("title") or "", it.get("url"),
                     "\n".join(f"- {e.strip()}" for e in (it.get("excerpts") or [])), now, "external",
                     it.get("publish_date"), " | ".join(queries))
                 for it in json.loads(raw).get("results", [])]
         return raw, hits
+
+
+def _url_key(url: str) -> str:
+    """One page, one hit: Exa and Parallel spell URLs differently (www., trailing slash, `.md` twins)."""
+    host, _, rest = re.sub(r"^https?://(www\.)?", "", url.split("#")[0], flags=re.I).partition("/")
+    path, q, query = rest.partition("?")
+    return f"{host.lower()}/{re.sub(r'(\.md|/)+$', '', path)}{q}{query}"
 
 
 # ------------------------------------------------------------------ query hygiene
@@ -271,14 +283,45 @@ def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
         raw = json.dumps([asdict(h) for h in hits], ensure_ascii=False).encode()
         return ToolResult(raw, render_hits(query, hits), hits, "lobby")
 
-    def web_many(queries: list[str], objective: str, n: int) -> tuple[dict, list[Hit]]:
-        if backend == "parallel" and parallel is not None:
-            raw, hits = parallel.search_many(queries, objective, n)
-            return {"parallel": raw.decode("utf-8")}, hits
-        with ThreadPoolExecutor(max_workers=max(1, len(queries))) as ex:
-            results = list(ex.map(lambda q: exa.search(q, n, mode="highlights", highlight_chars=agent_highlight_chars), queries))
-        raws = {q: r.decode("utf-8") for q, (r, _) in zip(queries, results)}
-        return raws, [h for _, hs in results for h in hs]
+    def web(queries: list[str], objective: str, n: int, chars: int, **exa_kw) -> tuple[dict, list[Hit], str, str]:
+        """Exa (one call per query) and Parallel (one batched call) at the same time, fused by RRF
+        over URLs. One provider failing or Parallel having no key still returns the other's hits.
+        Returns (raws, hits, providers used, note about failed providers)."""
+        use_par = backend in ("parallel", "both") and parallel is not None and parallel.ready()
+        use_exa = backend != "parallel" or not use_par
+        jobs = {}
+        with ThreadPoolExecutor(max_workers=len(queries) + 1) as ex:
+            if use_exa:
+                jobs |= {f"exa:{q}": ex.submit(exa.search, q, n, **exa_kw) for q in queries}
+            if use_par:
+                jobs["parallel"] = ex.submit(parallel.search_many, queries, objective, n, chars * n * len(queries))
+        raws, rankings, errors, by_key = {}, {}, {}, {}
+        for name, fut in jobs.items():
+            try:
+                raw, hits = fut.result()
+            except Exception as ex:
+                errors[name] = f"{type(ex).__name__}: {str(ex)[:200]}"
+                continue
+            raws[name] = raw.decode("utf-8")
+            rankings[name] = []
+            for h in hits:
+                k = _url_key(h.url or h.id)
+                if k not in rankings[name]:
+                    rankings[name].append(k)
+                if len(h.text) > len(by_key.get(k, h).text) or k not in by_key:  # keep the most quotable copy
+                    by_key[k] = h
+        if not rankings:
+            raise RuntimeError("web search failed: " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+        fused = []
+        for k, score, ranks in rrf(rankings):
+            by_key[k].signals = {**ranks, "rrf": round(score, 5)}
+            fused.append(by_key[k])
+        raws["fused"] = json.dumps([{"id": h.id, "signals": h.signals} for h in fused], ensure_ascii=False)
+        if errors:
+            raws["errors"] = json.dumps(errors, ensure_ascii=False)
+        used = "+".join(p for p in ("exa", "parallel") if any(r.startswith(p) for r in rankings))
+        failed = sorted({k.split(":")[0] for k in errors})
+        return raws, fused, used, f"({', '.join(failed)} failed; see the raw result)\n" if failed else ""
 
     def unified(query: str, sources: list[str] | None = None) -> ToolResult:
         sources = sources or ["exa", "rag", "lobby"]
@@ -295,21 +338,24 @@ def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
             hits += rh
             raws["rag"] = json.dumps([asdict(h) for h in rh], ensure_ascii=False)
             used.append("rag")
-        if "exa" in sources:
-            raw, eh = exa.search(query, num_results)
-            hits += eh
-            raws["exa"] = raw.decode("utf-8")
-            used.append("exa")
-        return ToolResult(json.dumps(raws, ensure_ascii=False).encode(), render_hits(query, hits), hits, "+".join(used))
+        note = ""
+        if "exa" in sources:  # "exa" = the web: Exa and/or Parallel per search_backend
+            wr, wh, wused, note = web([query], query, num_results, exa.max_chars)
+            hits += wh
+            raws |= wr
+            used.append(wused)
+        return ToolResult(json.dumps(raws, ensure_ascii=False).encode(), render_hits(query, hits) + note, hits,
+                          "+".join(used))
 
     def agent_search(queries: list[str], objective: str, skip_urls: list[str] | None = None) -> ToolResult:
         """Agent fan-out: several web queries + RAG, one retrieval, one annotation.
         URLs already retrieved in this run are omitted to save context."""
         skip = set(skip_urls or [])
-        raws, web = web_many(queries, objective, agent_num_results)
+        raws, web_h, used, note = web(queries, objective, agent_num_results, agent_highlight_chars,
+                                      mode="highlights", highlight_chars=agent_highlight_chars)
         rag_h = [h for q in queries for h in rag_hits(q)][:agent_num_results]
         hits, skipped, seen = [], [], set()
-        for h in rag_h + web:
+        for h in rag_h + web_h:
             key = h.id if h.source == "rag" else (h.url or h.id)  # chunks of one file are distinct
             if key in skip:
                 skipped.append(key)
@@ -319,9 +365,8 @@ def make_tools(exa: ExaClient, rag: Rag, derived: Derived, num_results: int = 5,
             seen.add(key)
             hits.append(h)
         raws["rag"] = json.dumps([asdict(h) for h in rag_h], ensure_ascii=False)
-        text = render_hits(" | ".join(queries), hits, sorted(set(skipped)))
-        return ToolResult(json.dumps(raws, ensure_ascii=False).encode(), text, hits,
-                          f"{'parallel' if backend == 'parallel' and parallel else 'exa'}+rag")
+        text = render_hits(" | ".join(queries), hits, sorted(set(skipped))) + note
+        return ToolResult(json.dumps(raws, ensure_ascii=False).encode(), text, hits, f"{used}+rag")
 
     return {"exa.search": exa_search, "exa.deep": exa_deep, "exa.fetch": exa_fetch, "lobby.search": lobby_search,
             "search": unified, "agent.search": agent_search}

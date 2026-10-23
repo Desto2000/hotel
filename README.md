@@ -66,7 +66,7 @@ refused and re-requested; on network or provider errors the key is saved with a 
 |---|---|
 | `EXA_API_KEY` (alias `MCP_EXA_API_KEY`) | Web search (required) |
 | `INCEPTION_API_KEY` | Mercury, the default model profile (required) |
-| `PARALLEL_API_KEY` | Optional search backend |
+| `PARALLEL_API_KEY` | Optional; web searches then query Exa and Parallel together (`search_backend`) |
 | `GROQ_API_KEY` (alias `HERMES_CUSTOM_GROQ_API_KEY`) | Optional `groq` profile |
 
 Environment variables take precedence over stored keys. Custom `llm_profiles` with their own `key_env`
@@ -350,8 +350,8 @@ uv run pytest -q     # offline; the agent loop is driven by ScriptedTransport
 | Deep research (Exa Deep Search + Exa Agent runs, gated like any retrieval) | Implemented | `search.py` |
 | Research agent | Implemented; tested live with Exa and groq | `agent.py` |
 | Resident policy (log-only appends, rate cap, bounty close, review queue) | Implemented | `core.py` |
-| Unified search (lobby FTS5 + RAG FTS5 + Exa) | Implemented | `search.py` |
-| Parallel search backend | Implemented to the Inception cookbook's shape; untested | `search.py` |
+| Unified search (lobby FTS5 + RAG FTS5 + Exa + Parallel) | Implemented | `search.py` |
+| Exa + Parallel web search (concurrent, de-duplicated by URL, fused by RRF; either one alone via `search_backend`) | Implemented; tested live | `search.py` |
 | RAG with one-way refs and logged promotion | Implemented | `rag.py`, `PromoteOp` |
 | Directory layer | Implemented | `derived.py` |
 | Replay harness | Implemented | `replay.py` |

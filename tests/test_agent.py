@@ -13,6 +13,7 @@ from hotel.gateway import GateBlocked, ToolResult, ToolSpec
 from hotel.librarian import ModelLibrarian, run_librarian
 from hotel.llm import LLM, ScriptedTransport
 from hotel.models import AppendOp
+from hotel.search import Hit, make_tools
 
 DOC = ("QUERY: q\n\n### [1] fake:1 (external) Exa docs\nurl: https://exa.ai/docs\n\n"
        "- Exa search accepts startPublishedDate and endPublishedDate filters in ISO 8601.\n")
@@ -156,3 +157,37 @@ def test_find_quote_tolerates_markdown_but_not_paraphrase():
     s = find_quote(t, "3B MLX Q8 | recommended default | 74.56")
     assert s and t[s[0]:s[1]].startswith("**3B") and "74.56" in t[s[0]:s[1]]
     assert find_quote(t, "3B MLX Q8 is recommended") is None
+
+
+def test_web_search_fuses_exa_and_parallel(hotel):
+    """Both providers run; one page under two URL spellings is one hit, and agreement ranks it first."""
+    def hit(src, url, text):
+        return Hit(src, url, url, url, text, "t", "external")
+
+    class FakeExa:
+        max_chars = 100
+
+        def search(self, q, n, **kw):
+            return b"{}", [hit("exa", "https://only-exa.com/x", "exa only"), hit("exa", "https://www.ex.com/a/", "short")]
+
+    class FakeParallel:
+        fail = False
+
+        def ready(self):
+            return True
+
+        def search_many(self, queries, objective, n, max_chars=None):
+            if self.fail:
+                raise RuntimeError("429")
+            return b"{}", [hit("parallel", "https://only-par.com/y", "par only"),
+                           hit("parallel", "https://ex.com/a.md", "a longer excerpt")]
+
+    par = FakeParallel()
+    tools = make_tools(FakeExa(), hotel.rag, hotel.derived, parallel=par, backend="both")
+    res = tools["agent.search"](["exa date filter api"], "o")
+    assert [h.url for h in res.data] == ["https://ex.com/a.md", "https://only-exa.com/x", "https://only-par.com/y"]
+    assert res.data[0].text == "a longer excerpt" and res.provider == "exa+parallel+rag"
+
+    par.fail = True  # Parallel down: Exa still answers, and the retrieval says so
+    res = tools["agent.search"](["exa date filter api"], "o")
+    assert [h.source for h in res.data] == ["exa", "exa"] and "parallel failed" in res.text

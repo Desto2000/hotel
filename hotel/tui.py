@@ -41,7 +41,7 @@ TYPE_CMDS = {"bounty": "bounty", "goal": "goal", "idea": "idea", "reason": "reas
 
 HELP = r"""[b]write[/b]   plain text → monologue in current room · /bounty /goal /idea /reason /log <text>
 [b]rooms[/b]   /room <slug>
-[b]search[/b]  /s <q> unified (exa+rag+lobby) · /exa <q> · /deep <q> (Exa Deep Search) · /fetch <url> · /ls <q> lobby only (ungated)
+[b]search[/b]  /s <q> unified (exa+parallel+rag+lobby) · /exa <q> · /deep <q> (Exa Deep Search) · /fetch <url> · /ls <q> lobby only (ungated)
 [b]gate[/b]    /annotate \[R:n] (ctrl+a) — required after every external retrieval
 [b]edit[/b]    /close L R:n · /supersede L <text> · /contest L <why> · /reopen L <why>
         /tag L t · /link L L · /ref L R:n · /promote L

@@ -79,7 +79,7 @@ DEFAULT_CONFIG = {
     "llm": "mercury",  # default router profile for agent + model librarian (see llm.py)
     "llm_profiles": {},  # overrides / extra OpenAI-compatible endpoints
     "librarian_output_mode": "json_schema",  # or "json_object"
-    "search_backend": "exa",  # "exa" | "parallel" for agent fan-out
+    "search_backend": "both",  # "both" (Exa + Parallel fused; Exa only without PARALLEL_API_KEY) | "exa" | "parallel"
     "agent_max_searches": 4,
     "bounty_revalidate_days": 90,  # closed bounties get `+ revalidate: <date>`; custodian flags them after
     "verifier": None,  # llm profile that checks model-written claims against their quotes (None = off)

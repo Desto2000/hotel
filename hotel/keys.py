@@ -68,7 +68,7 @@ PROVIDERS = [
     Provider("INCEPTION_API_KEY", "Mercury (Inception)", "default model for the agent, guest and model librarian",
              "https://platform.inceptionlabs.ai/", required=True,
              check=_models_status("inception")),
-    Provider("PARALLEL_API_KEY", "Parallel", "optional alternative search backend", "https://platform.parallel.ai/"),
+    Provider("PARALLEL_API_KEY", "Parallel", "optional second web search provider, fused with Exa", "https://platform.parallel.ai/"),
     Provider("GROQ_API_KEY", "Groq", "optional `groq` model profile", "https://console.groq.com/keys",
              aliases=("HERMES_CUSTOM_GROQ_API_KEY",),
              check=_models_status("groq")),

@@ -123,7 +123,7 @@ class Hotel:
         self.gateway = Gateway(self.reg, self.blobs, session_id, self.lobby_ids, rag_exists=self.rag.exists)
         exa = ExaClient(max_chars=self.cfg["exa_max_chars"])
         fns = make_tools(exa, self.rag, self.derived, self.cfg["exa_num_results"],
-                         parallel=ParallelClient(), backend=self.cfg.get("search_backend", "exa"),
+                         parallel=ParallelClient(), backend=self.cfg.get("search_backend", "both"),
                          agent_num_results=self.cfg.get("agent_num_results", 3),
                          agent_highlight_chars=self.cfg.get("agent_highlight_chars", 700),
                          exa_agent_effort=self.cfg["exa_agent_effort"], exa_agent_max_cost=self.cfg["exa_agent_max_cost"],

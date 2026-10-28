@@ -25,8 +25,8 @@ class Derived:
         self.index = index
         self.entries: list[dict] = []  # current entries, for dense search
 
-    def rebuild(self, text: str, directory_path: Path | None = None) -> Lobby:
-        lob = parse(text)
+    def rebuild(self, text: str, directory_path: Path | None = None, lob: Lobby | None = None) -> Lobby:
+        lob = lob or parse(text)  # lob: `text` already parsed by the caller
         c = self.conn
         c.execute("DROP TABLE IF EXISTS lobby_fts")
         c.execute("CREATE VIRTUAL TABLE lobby_fts USING fts5(eid UNINDEXED, room, type, status UNINDEXED, body, tags)")

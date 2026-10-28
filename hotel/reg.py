@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS reg (
 );
 CREATE INDEX IF NOT EXISTS reg_kind ON reg(kind);
 CREATE INDEX IF NOT EXISTS reg_ref ON reg(ref_id);
+CREATE INDEX IF NOT EXISTS reg_session ON reg(session_id, seq);
 CREATE TRIGGER IF NOT EXISTS reg_no_update BEFORE UPDATE ON reg
 BEGIN SELECT RAISE(ABORT, 'reg is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS reg_no_delete BEFORE DELETE ON reg
@@ -193,14 +194,14 @@ class Reg:
         r = self.conn.execute("SELECT * FROM reg WHERE id=?", (rid,)).fetchone()
         return RegEntry.from_row(r) if r else None
 
-    def list(self, session_id: str | None = None, kind: str | None = None, limit: int = 500) -> list[RegEntry]:
+    def list(self, session_id: str | None = None, kind: str | None = None, limit: int = 500,
+             tool: str | None = None, ref_id: int | None = None) -> list[RegEntry]:
+        """The latest `limit` rows matching every given filter, oldest first."""
         q, args = "SELECT * FROM reg WHERE 1=1", []
-        if session_id:
-            q += " AND session_id=?"
-            args.append(session_id)
-        if kind:
-            q += " AND kind=?"
-            args.append(kind)
+        for col, val in (("session_id", session_id), ("kind", kind), ("tool", tool), ("ref_id", ref_id)):
+            if val is not None:
+                q += f" AND {col}=?"
+                args.append(val)
         q += " ORDER BY id DESC LIMIT ?"
         args.append(limit)
         return [RegEntry.from_row(r) for r in self.conn.execute(q, args)][::-1]

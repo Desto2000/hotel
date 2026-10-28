@@ -17,9 +17,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-
-from exa_py import Exa
-from parallel import Parallel
+from typing import TYPE_CHECKING
 
 from . import keys
 from .concierge.index import rrf
@@ -27,6 +25,9 @@ from .derived import Derived
 from .gateway import ToolResult
 from .rag import Rag
 from .reg import utcnow
+
+if TYPE_CHECKING:  # the SDKs are imported on first use: they cost ~0.7 s, and most commands never search
+    from exa_py import Exa
 
 
 @dataclass
@@ -112,6 +113,7 @@ class ExaClient:
         key = self.api_key or keys.get("EXA_API_KEY")  # resolved per call: `hotel setup` can run while the TUI is open
         if not key:
             raise RuntimeError("EXA_API_KEY not set — run `hotel setup`")
+        from exa_py import Exa
         return Exa(api_key=key, timeout=timeout)
 
     @staticmethod
@@ -204,6 +206,7 @@ class ParallelClient:
         key = self.api_key or keys.get("PARALLEL_API_KEY")
         if not key:
             raise RuntimeError("PARALLEL_API_KEY not set — run `hotel setup`")
+        from parallel import Parallel
         client = Parallel(api_key=key, timeout=45, max_retries=0)  # _retry does the backoff
         extra = {"max_chars_total": max_chars} if max_chars else {}
         raw = _retry(lambda: client.search(

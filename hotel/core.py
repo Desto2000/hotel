@@ -71,12 +71,18 @@ def init_home(root: Path) -> Paths:
     return paths
 
 
-def _commit(root: Path, msg: str) -> str | None:
-    ident = []
-    if not git(root, "config", "user.name").stdout.strip():
-        ident = ["-c", "user.name=hotel", "-c", "user.email=hotel@localhost"]
-    r = git(root, *ident, "commit", "-q", "-m", msg)
-    if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+_IDENT: dict[Path, list[str]] = {}  # per lobby repo; looked up once per process (each git call costs ~40 ms on Windows)
+
+
+def _commit(root: Path, msg: str, *paths: str) -> str | None:
+    """Commit; with paths, commit just those files' working-tree content (no `git add` needed,
+    and anything else the user has staged in the lobby repo stays out of hotel's commit)."""
+    if root not in _IDENT:
+        _IDENT[root] = [] if git(root, "config", "user.name").stdout.strip() else \
+            ["-c", "user.name=hotel", "-c", "user.email=hotel@localhost"]
+    r = git(root, *_IDENT[root], "commit", "-q", "-m", msg, *(["--", *paths] if paths else []))
+    out = r.stdout + r.stderr
+    if r.returncode != 0 and "nothing to commit" not in out and "no changes added to commit" not in out:
         raise RuntimeError(f"git commit failed: {r.stderr.strip() or r.stdout.strip()}")
     return git(root, "rev-parse", "HEAD").stdout.strip() or None
 
@@ -182,10 +188,11 @@ class Hotel:
             return set()
 
     def rebuild(self) -> list[str]:
-        _, errs = validate_text(self.text(), self.oracle)
+        text = self.text()
+        lob, errs = validate_text(text, self.oracle)
         if errs:
             return errs
-        self.derived.rebuild(self.text(), self.paths.directory)
+        self.derived.rebuild(text, self.paths.directory, lob)
         return []
 
     def head_text(self) -> str | None:
@@ -213,8 +220,7 @@ class Hotel:
         errs = validate_transition(head, cur, self.oracle)
         if errs:
             return errs
-        git(self.paths.root, "add", "lobby.txt")
-        commit = _commit(self.paths.root, "hotel: hand edit (user)")
+        commit = _commit(self.paths.root, "hotel: hand edit (user)", "lobby.txt")
         self.gateway.log("lobby_edit", "user", payload={
             "ops": [], "hand_edit": True, "origin": "user",
             "before": self.blobs.put_text(head), "after": self.blobs.put_text(cur), "commit": commit,
@@ -262,9 +268,8 @@ class Hotel:
         atomic_write_text(self.paths.lobby, text)
         for rag_id, op in promotes:
             self.rag.add("promotion", "lobby-librarian", f"promoted {op.id}", op.text, doc_id=rag_id)
-        git(self.paths.root, "add", "lobby.txt")
         summary = ", ".join(f"{o.op} {getattr(o, 'id', getattr(o, 'room', ''))}" for o in ops)
-        commit = _commit(self.paths.root, f"lobby[{actor}/{origin}]: {summary}")
+        commit = _commit(self.paths.root, f"lobby[{actor}/{origin}]: {summary}", "lobby.txt")
         entry = self.gateway.log("lobby_edit", actor, ref_id=cause, payload={
             "ops": [op_dump(o) for o in ops], "created": op_ids, "origin": origin, "ts": ts,
             "revalidate_days": self.cfg.get("bounty_revalidate_days"),
@@ -375,8 +380,8 @@ class Hotel:
         p = row.payload or {}
         hashes += [p[k] for k in ("args_blob", "annotation_blob") if isinstance(p.get(k), str)]
         if row.kind == "retrieval":
-            for a in self.reg.list(kind="annotation", limit=100000):
-                if a.ref_id == rid and a.payload and a.payload.get("annotation_blob"):
+            for a in self.reg.list(kind="annotation", ref_id=rid, limit=10**9):
+                if a.payload and a.payload.get("annotation_blob"):
                     hashes.append(a.payload["annotation_blob"])
         hashes = sorted(set(hashes))
         deleted = [h for h in hashes if self.blobs.delete(h)]
@@ -429,8 +434,8 @@ class Hotel:
         out = self.reg.get(output_id)
         if not out or out.kind != "output":
             raise ValueError(f"R:{output_id} is not an output")
-        run = next((r for r in self.reg.list(kind="internal", limit=2000)
-                    if r.tool == "agent.finish" and r.payload.get("output") == output_id), None)
+        run = next((r for r in self.reg.list(kind="internal", tool="agent.finish", limit=10**9)
+                    if r.payload.get("output") == output_id), None)
         bounty = run.payload["bounty"] if run else None
         lob = self.lobby()
         room = room or (lob.entries[bounty].room if bounty in lob.entries else self.cfg.get("default_room", "inbox"))

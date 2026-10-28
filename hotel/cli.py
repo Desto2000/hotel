@@ -354,7 +354,7 @@ def _main(argv=None):
         r = h.accept_output(a.reg_id, a.room)
         print(f"{r.created[0]}  commit {r.commit[:8]}")
     elif a.cmd == "timings":
-        runs = [r for r in h.reg.list(kind="internal", limit=5000) if r.tool == "agent.finish"][-a.last:]
+        runs = h.reg.list(kind="internal", tool="agent.finish", limit=a.last)
         print(f"{'run':>7} {'bounty':<7} {'turns':>5} {'model ms':>9} {'tool ms':>8}  model share")
         for r in runs:
             p = r.payload

@@ -101,13 +101,15 @@ def test_agent_loop_gate_feedback_and_accept(hotel):
     routes = {r.op.op: r.route for r in results}
     assert routes == {"ref": "applied", "close": "queued"}
 
+    for _ in range(2001):  # the run's row is no longer among the latest internal rows; accept must still find it
+        hotel.gateway.log("internal", "user", tool="lobby.search")
     res = hotel.accept_output(run.output_id)
     e = hotel.lobby().entries[res.created[0]]
     assert e.origin == "approved" and e.type == "reasoning" and f"R:{rid}" in e.metas("ref")
     assert res.created[0] in hotel.lobby().entries[b].metas("link")
     assert hotel.check() == [] and hotel.reg.verify_chain() == []
     # large model prompts are stored as blobs, not inlined into Reg rows
-    model_rows = [r for r in hotel.reg.list() if r.kind == "model"]
+    model_rows = hotel.reg.list(kind="model")
     assert model_rows and all("args_blob" in r.payload and "ms" in r.payload for r in model_rows)
 
 

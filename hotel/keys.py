@@ -18,8 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from exa_py import Exa
-
 KEYS_FILE = Path.home() / ".config" / "hotel" / "keys.json"
 
 
@@ -35,6 +33,7 @@ class Provider:
 
 
 def _exa_status(key: str) -> int:
+    from exa_py import Exa  # imported on use: exa_py costs ~0.7 s at startup, and every command loads keys
     try:
         Exa(api_key=key, timeout=15).search("hotel", num_results=1)
     except ValueError as ex:  # exa-py: "Request failed with status code 401: ..."

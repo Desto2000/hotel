@@ -71,6 +71,30 @@ def test_reg_appends_from_threads_share_one_connection(hotel):
     assert hotel.reg.verify_chain() == []
 
 
+def test_identical_blobs_written_concurrently(tmp_path):
+    """Two writers storing the same content (two processes opening one lobby store the same
+    snapshot) must both succeed: the store is content-addressed, so either copy is the blob."""
+    import hashlib
+    import threading
+    from hotel.blobs import BlobStore
+    errors = []
+    for trial in range(10):
+        store, data = BlobStore(tmp_path / f"b{trial}"), b"x" * 500_000 + bytes([trial])
+
+        def writer():
+            try:
+                store.put(data)
+            except Exception as ex:
+                errors.append(ex)
+
+        threads = [threading.Thread(target=writer) for _ in range(4)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert store.get(hashlib.sha256(data).hexdigest()) == data
+    assert errors == []
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
 def test_event_log_mirrors_every_reg_row_without_content(hotel):
     """The timeline gets every row, but queries, results and lobby text stay in forgettable blobs."""
     import json

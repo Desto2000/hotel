@@ -336,6 +336,10 @@ uv sync
 uv run pytest -q     # offline; the agent loop is driven by ScriptedTransport
 ```
 
+CI (`.github/workflows/ci.yml`) runs the tests on Linux and Windows and fails if `uv.lock` or `constraints.txt` is
+out of date. After changing dependencies, run `uv lock` and
+`uv export --frozen --no-hashes --no-emit-project --no-dev -o constraints.txt`.
+
 ## Status
 
 | Component | State | Location |

@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]  # file locking, git and paths differ; both are supported
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+      - name: Lockfile matches pyproject.toml
+        run: uv lock --check
+      - name: constraints.txt matches uv.lock (the install scripts pin from it)
+        if: runner.os == 'Linux'
+        run: |
+          uv export --frozen --no-hashes --no-emit-project --no-dev -o constraints.txt
+          git diff --exit-code constraints.txt
+      - run: uv sync --locked
+      - run: uv run pytest -q  # offline: no API keys, no model downloads

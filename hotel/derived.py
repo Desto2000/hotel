@@ -28,13 +28,20 @@ class Derived:
     def rebuild(self, text: str, directory_path: Path | None = None, lob: Lobby | None = None) -> Lobby:
         lob = lob or parse(text)  # lob: `text` already parsed by the caller
         c = self.conn
-        c.execute("DROP TABLE IF EXISTS lobby_fts")
-        c.execute("CREATE VIRTUAL TABLE lobby_fts USING fts5(eid UNINDEXED, room, type, status UNINDEXED, body, tags)")
-        c.executemany(
-            "INSERT INTO lobby_fts VALUES (?,?,?,?,?,?)",
-            [(e.id, e.room, e.type, e.status, e.text, " ".join(e.metas("tag"))) for e in lob.entries.values()],
-        )
-        c.commit()
+        # One write transaction: two processes opening the lobby at once would otherwise both
+        # DROP, then both CREATE ("table lobby_fts already exists"); the second now waits.
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute("DROP TABLE IF EXISTS lobby_fts")
+            c.execute("CREATE VIRTUAL TABLE lobby_fts USING fts5(eid UNINDEXED, room, type, status UNINDEXED, body, tags)")
+            c.executemany(
+                "INSERT INTO lobby_fts VALUES (?,?,?,?,?,?)",
+                [(e.id, e.room, e.type, e.status, e.text, " ".join(e.metas("tag"))) for e in lob.entries.values()],
+            )
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
         self.entries = [dict(eid=e.id, room=e.room, type=e.type, status=e.status, body=e.text) for e in lob.entries.values()]
         if directory_path is not None:
             directory_path.write_text(render_directory(lob, text), encoding="utf-8", newline="\n")

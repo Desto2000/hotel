@@ -179,12 +179,13 @@ class Reg:
                 cur = c.execute(
                     f"INSERT INTO reg({cols}) VALUES ({','.join('?' * len(fields))})", tuple(fields.values())
                 )
-                rid = cur.lastrowid
                 c.execute("COMMIT")
             except Exception:
                 c.execute("ROLLBACK")
                 raise
-        entry = self.get(rid)
+            # Built from what was written, not read back: a read outside the lock on this
+            # shared connection raced other threads' appends (get() returned None on Linux CI).
+            entry = RegEntry.from_row({"id": cur.lastrowid, **fields})
         if self.events:
             self.events.reg_row(entry)
         return entry

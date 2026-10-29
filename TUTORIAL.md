@@ -6,7 +6,7 @@ against a fresh lobby, and the output shown is what Hotel prints.
 
 You will:
 
-1. create a lobby and add your API keys
+1. install Hotel, create a lobby and add your API keys
 2. write a question (a *bounty*) and some notes
 3. search the web, and annotate the result (the step that confuses everyone at first)
 4. close the bounty with that evidence
@@ -26,28 +26,40 @@ press **Ctrl+A** (or F2). That's how you unlock it.
 `R:3` is a **Reg id**: a numbered row in the log of everything Hotel did. `L0001` is a **lobby id**: one
 entry in your notes. Most commands take one or the other.
 
-## 1. Set up
+## 1. Install and set up
 
-Install Hotel (see [Installation](README.md#installation)), then create a lobby. Any empty directory works:
+You need `git`. Install Hotel with one line; it adds [uv](https://docs.astral.sh/uv/) if you don't have it,
+and uv downloads the Python 3.14 that Hotel runs on:
 
 ```
-hotel init ~/lobby
-hotel doctor
+curl -fsSL https://hotel.lovania.dev/install.sh | bash     # Linux, macOS
+irm https://hotel.lovania.dev/install.ps1 | iex            # Windows PowerShell
 ```
 
-`doctor` should report `[ok  ]` for git, the hotel home, and the lobby. It reports `warn` for missing keys
-and backups. Now open the TUI:
+Open a new terminal if `hotel` isn't found yet, then start it:
 
 ```
 hotel
 ```
 
-(If you skipped `hotel init`, plain `hotel` offers to create `~/lobby` for you.)
+Your notes need a home: a folder holding `lobby.txt`, tracked in git. The first time, Hotel asks:
 
-The first launch walks you through onboarding. Paste your `EXA_API_KEY` (search) and `INCEPTION_API_KEY`
-(the Mercury model). No account yet? Each key step shows the provider's sign-up page, and `ctrl+o` opens it
-in your browser. Each key is checked live. A short tour of the basics follows; `/tutorial` replays it. You
-can skip onboarding with Escape and come back with `/setup`.
+```
+Create it at /home/you/lobby? [Enter = yes, or type another folder, n = cancel]
+```
+
+Press Enter. From now on `hotel` opens this lobby from any directory. Then the TUI opens on onboarding,
+one step at a time:
+
+| Step | What to do |
+|---|---|
+| API keys | Paste `EXA_API_KEY` (web search) and `INCEPTION_API_KEY` (the Mercury model). No account yet? The step shows the provider's sign-up page; `ctrl+o` opens it in your browser. Each key is checked live. `PARALLEL_API_KEY` and `GROQ_API_KEY` are optional: press Enter on the empty field to skip. |
+| Privacy | Mercury trains on API traffic unless you turn that off in the Inception dashboard (`ctrl+o` opens it). Press `y` once it's off. Until then Hotel won't send lobby content to Mercury. |
+| Theme | Pick a look with the arrow keys; it changes as you move. |
+| Tour | Three short pages on notes, the gate, and letting models help. |
+
+Escape finishes later; `/setup` reopens onboarding and `/tutorial` replays the tour. The last screen lists
+which keys are ready.
 
 The screen has four parts:
 
@@ -183,6 +195,8 @@ lobby directly. Instead:
 | Look at the full text behind any Reg row | `/blob R:n`, or select the row in the Reg tab |
 | Fix a wrong entry | `/supersede L <text>`, `/contest L <why>` |
 | Back up everything | `/backup` or `hotel backup` |
+| Get the latest Hotel | `hotel update` (`--check` only lists what's new) |
+| Bring your own documents into search | `hotel rag import <files or folders>` (see [RAG](README.md#rag)) |
 
 ## When something goes wrong
 
@@ -191,5 +205,7 @@ lobby directly. Instead:
 | `⛔ annotation gate: annotate R:n before the next call` | A retrieval is waiting. Press Ctrl+A. Starting a new session doesn't clear it. |
 | `quote not found in the stored data` | Copy the quote from the annotation window's left pane. |
 | `validator rejected: …` | The edit would break lobby rules, such as closing with an unannotated `R:`, changing an entry's body, or an illegal status change. The message names the rule. |
-| `no hotel home found` | Run `hotel init <dir>`, or `hotel home <dir>` to point at an existing lobby. |
+| `hotel` isn't found after installing | Open a new terminal so it picks up the updated `PATH`. |
+| `no hotel home found` | Run `hotel` in a terminal to be offered `~/lobby`, `hotel init <dir>` to create one elsewhere, or `hotel home <dir>` to point at an existing lobby. |
+| `not confirmed: model features stay blocked until you do (/setup)` | Turn off training in the Inception dashboard, then `/setup` and press `y` on the privacy step. |
 | Search or research fails right away | Run `hotel doctor` to see which keys are missing, then `/setup`. |

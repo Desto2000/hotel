@@ -4,9 +4,17 @@ Hotel is a command-line and terminal-UI tool for research notes. Your notes live
 document (the *lobby*). Every tool call is recorded in an append-only log (the *Reg*). When Hotel gets
 a result from the web, you must annotate it with a quote before you can use it.
 
-You need Python 3.12 or later and `git`.
+Hotel runs on Linux, macOS and Windows. It needs `git` and [uv](https://docs.astral.sh/uv/); the installer
+adds uv if it's missing. Hotel requires Python 3.14, and uv downloads it, so you don't need a system Python.
 
-New to Hotel? Start with the [tutorial](TUTORIAL.md). It walks through one full session in about 15 minutes.
+```
+curl -fsSL https://hotel.lovania.dev/install.sh | bash     # Linux, macOS
+irm https://hotel.lovania.dev/install.ps1 | iex            # Windows PowerShell
+hotel                                                      # first run: creates ~/lobby, then onboarding
+```
+
+New to Hotel? Start with the [tutorial](TUTORIAL.md) (also at [hotel.lovania.dev/tutorial](https://hotel.lovania.dev/tutorial)).
+It walks through one full session in about 15 minutes.
 
 ## Contents
 
@@ -16,6 +24,7 @@ New to Hotel? Start with the [tutorial](TUTORIAL.md). It walks through one full 
 - [Usage](#usage)
 - [Lobby grammar](#lobby-grammar)
 - [Agents](#agents)
+- [Deep research](#deep-research)
 - [RAG and the Concierge](#rag-and-the-concierge)
 - [MCP server](#mcp-server)
 - [Data safety](#data-safety)
@@ -35,13 +44,56 @@ New to Hotel? Start with the [tutorial](TUTORIAL.md). It walks through one full 
 
 ## Installation
 
+### One-line installer
+
+```
+curl -fsSL https://hotel.lovania.dev/install.sh | bash     # Linux, macOS
+irm https://hotel.lovania.dev/install.ps1 | iex            # Windows PowerShell
+```
+
+The installer:
+
+1. installs uv if it's missing (you still need `git`)
+2. keeps a managed clone of this repository: `~/.local/share/hotel/src` on Linux and macOS,
+   `%LOCALAPPDATA%\hotel\src` on Windows
+3. installs `hotel` from that clone with `uv tool install`, on the Python and dependency versions pinned by
+   `.python-version` and `constraints.txt`
+4. records the install in `~/.config/hotel/install.json`
+
+To install a specific branch, tag or commit, set `HOTEL_REF` (default `master`). The ref is recorded,
+and `hotel update` uses it:
+
+```
+curl -fsSL https://hotel.lovania.dev/install.sh | HOTEL_REF=09afd12 bash
+$env:HOTEL_REF = "09afd12"; irm https://hotel.lovania.dev/install.ps1 | iex
+```
+
+The installer doesn't create a lobby. The first plain `hotel` offers to create `~/lobby` (or a folder you
+type), or run `hotel init <dir>` yourself.
+
+### Updating
+
+```
+hotel update            # fetch the latest commits, list them, reinstall
+hotel update --check    # only report what's new
+```
+
+On Windows a running program can't replace itself, so the reinstall finishes in a new console window after
+`hotel` exits. Rerunning the one-line installer also updates. Neither touches your lobby or API keys.
+
+### From a checkout (contributors)
+
 ```
 git clone https://github.com/Desto2000/hotel.git && cd hotel
 scripts/install.sh [~/lobby]              # Git Bash / macOS / Linux
 ./scripts\install.ps1 [-LobbyDir ~\lobby] # PowerShell
 ```
 
-The installed tool is a pinned copy, not a live checkout. Re-run the install script after pulling new code.
+These scripts need uv and git already installed. They install a pinned copy of the checkout, not a live
+link to it, and create the lobby if it doesn't exist. Re-run the script after pulling new code. Use
+`uv run hotel` to run the checkout directly while developing.
+
+### Where Hotel looks for your lobby
 
 `hotel` locates its home in this order:
 
@@ -54,15 +106,25 @@ The installed tool is a pinned copy, not a live checkout. Re-run the install scr
 
 ## Configuration
 
-### API keys
+### First run and API keys
 
-Just run `hotel`. If no lobby exists yet, it offers to create one at `~/lobby`. The first time the TUI
-opens it walks you through onboarding: welcome, each API key (checked live, with a link to the provider's
-sign-up page; `ctrl+o` opens it), the Mercury training opt-out, a theme preview, and a three-page tour of
-the basics. `/setup` reopens it, `/tutorial` replays just the tour, and `hotel setup` sets the keys on the
-command line. Each key is read hidden, checked against its provider, and stored in
-`~/.config/hotel/keys.json`, which is outside the lobby and its backups. A key rejected with 401/403 is
-refused and re-requested; on network or provider errors the key is saved with a note.
+Just run `hotel`. If no lobby exists yet, it offers to create one at `~/lobby` (press Enter, or type another
+folder). The first time the TUI opens, it walks you through onboarding:
+
+1. a welcome screen
+2. each API key, with a link to the provider's sign-up page (`ctrl+o` opens it). Each key is checked live
+   against its provider; press Enter on an empty field to skip an optional key.
+3. the Mercury training opt-out: Mercury trains on API traffic unless you turn that off in the Inception
+   dashboard, so Hotel won't send lobby content to it until you confirm (`y`)
+4. the theme, previewed live as you move through the list
+5. a three-page tour of the basics
+
+Press Escape to finish later. `/setup` reopens onboarding, and `/tutorial` replays just the tour.
+`hotel init <dir>` only creates a lobby; it no longer asks for keys. To set keys without the TUI, run
+`hotel setup`, which reads each key hidden.
+
+Keys are stored in `~/.config/hotel/keys.json`, outside the lobby and its backups. A key rejected with
+401/403 is refused and re-requested; on network or provider errors the key is saved with a note.
 
 | Variable | Used for |
 |---|---|
@@ -104,6 +166,7 @@ In the TUI, plain text is appended to the current room as a monologue. Commands:
 /move L room     /custodian               /backup [dir]
 /lib [R:n]       (ctrl+l) run librarian    /approve R:n   /reject R:n
 /blob R:n        /check   /verify   /theme (ctrl+t)
+/help            /setup (keys, privacy, theme)   /tutorial (the tour)   /q (ctrl+q)
 ```
 
 The theme is read at runtime from `hotel/themes/calculus.json`, which is a Zed theme file used unchanged.
@@ -112,7 +175,8 @@ UI roles map to Zed keys, and lobby syntax maps to Zed syntax scopes.
 ### CLI
 
 ```
-hotel add | search | annotate <json> | lib <rid> | research <L> | guest "<msg>" [--note]
+hotel [tui] | init <dir> | update [--check]
+      | add | search | annotate <json> | lib <rid> | research <L> | guest "<msg>" [--note]
       | accept <rid> | move <L> <room> | custodian | backup [dir] | restore <src> <dst>
       | forget <rid> --reason | home [dir] | setup | keys list|set|rm | doctor | version
       | timings | log | render | snapshot | review list|approve|reject | check | verify | rebuild
@@ -191,6 +255,16 @@ tool-calling loop with no framework, and it never writes to the lobby directly.
   it with `origin=approved`.
 - The guest's replies are not written to the lobby.
 - Start a line with `>` to talk without recording it. Messages sent while a turn is running are queued.
+
+## Deep research
+
+`/deep <q>`, the research agent's `deep_research` tool (once per task) and the MCP `deep_research` tool run
+Exa's research products through the `exa-py` SDK. `depth: "deep"` is Deep Search (`type=deep`: Exa iterates
+its own searches, optional `angles` seed distinct sub-questions); `depth: "agent"` is an Exa Agent run
+(async, minutes, billed per run). Both land as one retrieval that must be annotated like any other: the
+selected pages are `external` with real highlights to quote, while Exa's synthesis is flagged `secondhand`.
+Agent runs are configured in `.hotel/config.json`: `exa_agent_effort` (default `medium`, fixed price per run),
+`exa_agent_max_cost` (USD cap, only for `auto`/`ultra`) and `exa_agent_timeout_s`.
 
 ## RAG and the Concierge
 
@@ -284,9 +358,10 @@ serverless platforms (Lambda, Vercel, Workers) are not suitable.
 - Your own machine with a tunnel. The lobby stays next to the TUI. Bind to `127.0.0.1`, set a token, and let
   the tunnel provide TLS. Examples: `tailscale serve --bg 8765` (tailnet only), `tailscale funnel --bg 8765`
   (public URL), or `cloudflared tunnel --url http://localhost:8765` (optionally with Cloudflare Access).
-- An always-on server (VPS, Fly.io or Railway with a volume, home server). Run `scripts/install.sh /data/lobby`.
-  Then run `hotel mcp --http --host 0.0.0.0` under systemd, behind a proxy such as Caddy or nginx that handles
-  TLS. Use the TUI over `ssh`, and point `hotel backup` at a second disk.
+- An always-on server (VPS, Fly.io or Railway with a volume, home server). Install Hotel with the one-line
+  installer and create the lobby with `hotel init /data/lobby`. Then run `hotel mcp --http --host 0.0.0.0`
+  under systemd, behind a proxy such as Caddy or nginx that handles TLS. Use the TUI over `ssh`, and point
+  `hotel backup` at a second disk.
 
 The client's model sees any lobby text that it reads. The data policy of its provider applies to that text.
 
@@ -365,13 +440,3 @@ out of date. After changing dependencies, run `uv lock` and
 | Guest agent, custodian, move, forget, backup/restore, verifier, usage logging, install scripts | Implemented (v0.2) | `guest.py`, `core.py`, `backup.py`, `verify.py`, `scripts/` |
 | MCP server (stdio and HTTP with bearer token) | Implemented | `mcp_server.py` |
 | sqlite-vec embeddings, talk/solve agents, concierge, custodian dedup, hotel renderer | Not implemented | — |
-
-## Deep research
-
-`/deep <q>`, the research agent's `deep_research` tool (once per task) and the MCP `deep_research` tool run
-Exa's research products through the `exa-py` SDK. `depth: "deep"` is Deep Search (`type=deep`: Exa iterates
-its own searches, optional `angles` seed distinct sub-questions); `depth: "agent"` is an Exa Agent run
-(async, minutes, billed per run). Both land as one retrieval that must be annotated like any other: the
-selected pages are `external` with real highlights to quote, while Exa's synthesis is flagged `secondhand`.
-Agent runs are configured in `.hotel/config.json`: `exa_agent_effort` (default `medium`, fixed price per run),
-`exa_agent_max_cost` (USD cap, only for `auto`/`ultra`) and `exa_agent_timeout_s`.

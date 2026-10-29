@@ -216,7 +216,6 @@ typing-extensions==4.16.0
     #   anyio
     #   exa-py
     #   groq
-    #   httpx2
     #   huggingface-hub
     #   inceptionai
     #   mcp
@@ -226,8 +225,6 @@ typing-extensions==4.16.0
     #   parallel-web
     #   pydantic
     #   pydantic-core
-    #   referencing
-    #   starlette
     #   textual
     #   typing-inspection
 typing-inspection==0.4.4

@@ -160,7 +160,8 @@ def missing_required() -> list[Provider]:
 
 
 def onboarded() -> bool:
-    """True once setup ran (CLI wizard or the TUI's first-run screen)."""
+    """True once the TUI's first-run walkthrough ran. `hotel setup` (keys only) doesn't count,
+    so the first open still shows the tour; keys stored by then show as ready."""
     return KEYS_FILE.with_name("onboarded").exists()
 
 
@@ -201,7 +202,7 @@ def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[s
                 out("")
                 continue
         else:
-            out(f"  get a key: {p.url}")
+            out(f"  no account? sign up and create a key at {p.url}")
         for _ in range(3):
             key = secret(f"  paste {p.env} (hidden, Enter to skip): ").strip()
             if not key:
@@ -218,7 +219,6 @@ def onboard(*, home=None, ask: Callable[[str], str] = input, secret: Callable[[s
             break
     if home is not None and (only is None or "INCEPTION_API_KEY" in only):
         _optout_step(home, ask, out)
-    mark_onboarded()
     left = missing_required()
     if left:
         out("still missing (required): " + ", ".join(p.env for p in left) + " — rerun `hotel setup` any time")

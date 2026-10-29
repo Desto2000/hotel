@@ -42,8 +42,12 @@ and backups. Now open the TUI:
 hotel
 ```
 
-The first launch shows the onboarding screen. Paste your `EXA_API_KEY` (search) and `INCEPTION_API_KEY`
-(the Mercury model). Each key is checked live. You can skip it with Escape and come back with `/setup`.
+(If you skipped `hotel init`, plain `hotel` offers to create `~/lobby` for you.)
+
+The first launch walks you through onboarding. Paste your `EXA_API_KEY` (search) and `INCEPTION_API_KEY`
+(the Mercury model). No account yet? Each key step shows the provider's sign-up page, and `ctrl+o` opens it
+in your browser. Each key is checked live. A short tour of the basics follows; `/tutorial` replays it. You
+can skip onboarding with Escape and come back with `/setup`.
 
 The screen has four parts:
 

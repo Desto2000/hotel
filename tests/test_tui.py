@@ -77,3 +77,47 @@ def test_onboarding_saves_only_accepted_keys_and_finishes(tmp_path, monkeypatch)
     assert asyncio.run(go()) == "Screen"
     assert keys.get("EXA_API_KEY") == "right-key" and keys.source("INCEPTION_API_KEY") is None
     assert keys.onboarded()
+
+
+def test_onboarding_walks_keys_then_tour_and_links_to_sign_up(tmp_path, monkeypatch):
+    from hotel import keys
+    from hotel.tui import TOUR, TUTORIAL_URL, OnboardingScreen
+    monkeypatch.setattr(keys, "KEYS_FILE", tmp_path / "cfg" / "keys.json")
+    for p in keys.PROVIDERS:
+        for e in (p.env, *p.aliases):
+            monkeypatch.delenv(e, raising=False)
+    init_home(tmp_path / "home")
+    h = Hotel(Paths(tmp_path / "home"))
+    opened, seen = [], []
+
+    async def go():
+        app = HotelApp(h, splash=False, onboard=False)
+        monkeypatch.setattr(app, "open_url", lambda url, **kw: opened.append(url))
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.push_screen(OnboardingScreen(h))
+            await pilot.pause()
+            ob = app.screen
+            await pilot.press("enter")  # welcome -> first key
+            await pilot.press("ctrl+o")
+            for _ in keys.PROVIDERS:
+                await pilot.press("enter")  # skip each key
+            assert ob.step == "privacy"
+            await pilot.press("ctrl+o", "n", "enter")  # privacy, theme
+            for i in range(len(TOUR)):
+                assert ob.step == ("tour", i)
+                seen.append(str(ob.query_one("#ob-body").render()))
+                await pilot.press("enter")
+            assert ob.step == "ready"
+            await pilot.press("left")  # back to the last tour page
+            assert ob.step == ("tour", len(TOUR) - 1)
+            await pilot.press("ctrl+o", "enter", "enter")
+            await pilot.pause()
+            assert not isinstance(app.screen, OnboardingScreen)
+            await pilot.press(*"/tutorial", "enter")  # replays only the tour
+            await pilot.pause()
+            assert app.screen.steps[0] == ("tour", 0) and "welcome" not in app.screen.steps
+
+    asyncio.run(go())
+    assert opened == [keys.PROVIDERS[0].url, keys.BY_ENV["INCEPTION_API_KEY"].url, TUTORIAL_URL]
+    assert "/bounty" in seen[0] and "ctrl+a" in seen[1] and TUTORIAL_URL in seen[-1]
+    assert keys.onboarded()

@@ -19,4 +19,4 @@ if [ ! -d "$home/.hotel" ]; then
 fi
 hotel home "$home" >/dev/null
 hotel doctor || true
-echo "done: run 'hotel' from any directory"
+echo "done: run 'hotel' from any directory. The first open walks you through API keys and a short tour."

@@ -56,8 +56,10 @@ The installed tool is a pinned copy, not a live checkout. Re-run the install scr
 
 ### API keys
 
-The first time the TUI opens it shows an onboarding screen (welcome, live key checks, the Mercury
-training opt-out, theme preview). `/setup` reopens it, and `hotel setup` provides the same flow on the
+Just run `hotel`. If no lobby exists yet, it offers to create one at `~/lobby`. The first time the TUI
+opens it walks you through onboarding: welcome, each API key (checked live, with a link to the provider's
+sign-up page; `ctrl+o` opens it), the Mercury training opt-out, a theme preview, and a three-page tour of
+the basics. `/setup` reopens it, `/tutorial` replays just the tour, and `hotel setup` sets the keys on the
 command line. Each key is read hidden, checked against its provider, and stored in
 `~/.config/hotel/keys.json`, which is outside the lobby and its backups. A key rejected with 401/403 is
 refused and re-requested; on network or provider errors the key is saved with a note.

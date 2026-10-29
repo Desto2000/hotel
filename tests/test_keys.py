@@ -80,3 +80,18 @@ def test_wizard_leaves_environment_keys_alone(monkeypatch):
     monkeypatch.setenv("EXA_API_KEY", "e")
     keys.onboard(ask=script([]), secret=script(["", "", ""]), out=lambda s: None, only=["EXA_API_KEY"])
     assert keys.get("EXA_API_KEY") == "e" and not keys.KEYS_FILE.exists()
+
+
+def test_first_open_without_a_home_offers_one_then_opens_the_tui(tmp_path, monkeypatch):
+    from hotel import cli, config, tui
+    monkeypatch.setattr(config, "USER_HOME_FILE", tmp_path / "cfg" / "home")
+    monkeypatch.delenv("HOTEL_HOME", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(keys, "interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: str(tmp_path / "notes"))
+    opened = []
+    monkeypatch.setattr(tui.HotelApp, "run", lambda self: opened.append(self.hotel.paths.root))
+    cli.main([])
+    root = (tmp_path / "notes").resolve()
+    assert opened == [root] and (root / "lobby.txt").exists()
+    assert config.find_root(tmp_path / "elsewhere") == root  # became the default home

@@ -14,6 +14,7 @@ import shlex
 import threading
 from pathlib import Path
 
+from rich.style import Style
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -50,7 +51,7 @@ HELP = r"""[b]write[/b]   plain text → monologue in current room · /bounty /g
 [b]agent[/b]   /research L#### (one bounty per run) · /accept R:n keep an answer as an approved entry
 [b]house[/b]   /move L <room> \[why] · /custodian (flag stale closed bounties) · /backup \[dir]
 [b]resident[/b] /lib \[R:n] run librarian · /approve R:n · /reject R:n
-[b]inspect[/b] /blob R:n\[#ck] \[all|raw] (a claim: just its section, quote highlighted) · /check · /verify · /theme (ctrl+t) · /setup (keys, privacy, theme) · /q"""
+[b]inspect[/b] /blob R:n\[#ck] \[all|raw] (a claim: just its section, quote highlighted) · /check · /verify · /theme (ctrl+t) · /setup (keys, privacy, theme) · /tutorial · /q"""
 
 
 # ======================================================================== opening
@@ -128,12 +129,38 @@ class OpeningScreen(Screen):
         self.dismiss(None)
 
 
+TUTORIAL_URL = "https://github.com/Desto2000/hotel/blob/main/TUTORIAL.md"
+
+# The tour: (title, intro, [(what you type, what it does)], outro). Each page is one onboarding step.
+TOUR = [
+    ("your notes", "Your notes live in one plain-text file, the lobby, split into rooms.",
+     [("a plain line of text", "a note in the current room"),
+      ("/room harness", "switch room"),
+      ("/bounty Is X true?", "a question to close with evidence"),
+      ("/idea /goal /reason", "other kinds of entry")],
+     "Each entry gets an id like L0001. Hand edits to lobby.txt are fine."),
+    ("the gate", "A web result enters your notes only with a claim and a quote.",
+     [("/s exa date filter", "search the web (logged as R:n)"),
+      ("ctrl+a", "annotate: your claim + an exact quote"),
+      ("/close L0001 R:4", "close the bounty with that evidence")],
+     "Until you annotate, new searches wait (status bar: gate LOCKED)."),
+    ("let hotel help", "Models draft; nothing reaches the lobby until you approve it.",
+     [("/research L0001", "the agent answers a bounty"),
+      ("/guest", "talk it through; drafts go to Review"),
+      ("/approve R:n", "keep a draft (or /reject R:n)"),
+      ("/help  /tutorial", "all commands · this tour again")],
+     "The full walkthrough takes about 15 minutes:"),
+]
+
+
 class OnboardingScreen(Screen):
     """First-run setup, one step at a time: welcome, each API key (checked live against
-    the provider), the Mercury training opt-out, the theme (previewed live), ready.
-    Enter moves on; esc finishes later (`/setup` reopens it)."""
+    the provider, with its sign-up page), the Mercury training opt-out, the theme (previewed
+    live), a short tour, ready. Enter moves on; esc finishes later (`/setup` reopens it,
+    `/tutorial` replays just the tour)."""
 
-    BINDINGS = [Binding("escape", "finish", "finish later", priority=True)]
+    BINDINGS = [Binding("escape", "finish", "finish later", priority=True),
+                Binding("ctrl+o", "open_link", "open link", priority=True)]
     CSS = """
     OnboardingScreen { align: center middle; background: $background; }
     #ob { width: 76; height: auto; }
@@ -150,13 +177,15 @@ class OnboardingScreen(Screen):
     #ob-hint { width: 100%; text-align: center; color: $hotel-muted; margin-top: 1; }
     """
 
-    def __init__(self, hotel: Hotel, *, check: bool = True, probe=None):
+    def __init__(self, hotel: Hotel, *, check: bool = True, probe=None, tour_only: bool = False):
         super().__init__()
         self.hotel, self.check, self.probe = hotel, check, probe
-        self.steps: list = ["welcome", *keys.PROVIDERS]
-        if not hotel.cfg.get("inception_training_opt_out_confirmed"):
-            self.steps.append("privacy")
-        self.steps += ["theme", "ready"]
+        tour = [("tour", i) for i in range(len(TOUR))]
+        self.steps: list = [*tour, "ready"] if tour_only else ["welcome", *keys.PROVIDERS]
+        if not tour_only:
+            if not hotel.cfg.get("inception_training_opt_out_confirmed"):
+                self.steps.append("privacy")
+            self.steps += ["theme", *tour, "ready"]
         self.n = 0
         self.note = Text()
         self.busy = False
@@ -195,13 +224,11 @@ class OnboardingScreen(Screen):
             body.append("models do goes through a logged Reg; what lasts is one plain-text\n", st["body"])
             body.append("document, the lobby.\n\n", st["body"])
             body.append("Setup takes a minute: ", st["muted"])
-            body.append("API keys", st["type"])
-            body.append(", ", st["muted"])
-            body.append("privacy", st["type"])
-            body.append(", ", st["muted"])
-            body.append("theme", st["type"])
-            body.append(".", st["muted"])
-            hint = "enter  get started   ·   esc  later"
+            for i, part in enumerate(("API keys", "privacy", "theme", "a short tour")):
+                body.append(", " if i else "", st["muted"])
+                body.append(part, st["type"])
+            body.append(".\nNo keys yet? Each step links to its sign-up page.", st["muted"])
+            hint = "enter  get started   ·   ctrl+o  full tutorial   ·   esc  later"
         elif isinstance(step, keys.Provider):
             p, src = step, keys.source(step.env)
             card.border_title = p.name
@@ -217,14 +244,15 @@ class OnboardingScreen(Screen):
                     body.append(f"stored key {keys.mask(keys.get(p.env) or '')}", st["body"])
                     body.append(" · paste a new one to replace it", st["muted"])
                 else:
-                    body.append("get a key  ", st["muted"])
-                    body.append(p.url, st["meta_ref"])
+                    body.append("no account? sign up and create a key at\n", st["muted"])
+                    body.append(p.url, st["meta_ref"] + Style(link=p.url, underline=True))
                 inp.display = True
                 inp.placeholder = f"paste {p.env}"
                 inp.disabled = False
                 inp.value = ""
                 inp.focus()
-                hint = "enter  save   ·   enter on empty  " + ("keep" if src == "file" else "skip") + "   ·   esc  later"
+                hint = ("enter  save   ·   empty  " + ("keep" if src == "file" else "skip")
+                        + "   ·   ctrl+o  sign-up page   ·   esc  later")
         elif step == "privacy":
             card.border_title = "privacy"
             body.append("Mercury trains on API traffic unless you opt out in the Inception\n", st["body"])
@@ -235,8 +263,11 @@ class OnboardingScreen(Screen):
             body.append("  y ", st["accent"])
             body.append(" yes, it's off       ", st["body"])
             body.append("  n ", st["accent"])
-            body.append(" not yet", st["body"])
-            hint = "y / n   ·   esc  later"
+            body.append(" not yet\n\n", st["body"])
+            body.append("dashboard  ", st["muted"])
+            url = keys.BY_ENV["INCEPTION_API_KEY"].url
+            body.append(url, st["meta_ref"] + Style(link=url, underline=True))
+            hint = "y / n   ·   ctrl+o  open dashboard   ·   esc  later"
         elif step == "theme":
             card.border_title = "theme"
             body.append("Pick a look. It changes as you move.\n\n", st["body"])
@@ -245,6 +276,20 @@ class OnboardingScreen(Screen):
                 body.append(" ❯ " if cur else "   ", st["accent"])
                 body.append(name + "\n", st["room_name"] if cur else st["muted"])
             hint = "↑ ↓  choose   ·   enter  confirm"
+        elif isinstance(step, tuple):  # ("tour", i)
+            i = step[1]
+            title, intro, rows, outro = TOUR[i]
+            card.border_title = f"tour {i + 1}/{len(TOUR)} · {title}"
+            body.append(intro + "\n\n", st["body"])
+            width = max(len(cmd) for cmd, _ in rows) + 3
+            for cmd, what in rows:
+                body.append("  " + cmd.ljust(width), st["accent"])
+                body.append(what + "\n", st["muted"])
+            body.append("\n" + outro, st["muted"])
+            if i == len(TOUR) - 1:
+                body.append("\n" + TUTORIAL_URL, st["meta_ref"] + Style(link=TUTORIAL_URL, underline=True))
+            back = "← back   ·   " if i else ""
+            hint = f"enter  next   ·   {back}ctrl+o  full tutorial   ·   esc  skip"
         else:
             card.border_title = "ready"
             left = keys.missing_required()
@@ -256,9 +301,11 @@ class OnboardingScreen(Screen):
                 body.append("ready\n" if ok else ("missing\n" if p.required else "skipped\n"),
                             st["muted"] if ok or not p.required else st["warning"])
             if left:
-                body.append("\nsearch and model features stay off until the required keys are set (/setup)",
+                body.append("\nsearch and models stay off until the required keys are set (/setup)\n",
                             st["muted"])
-            hint = "enter  open the lobby"
+            body.append("\nfirst thing to try  ", st["muted"])
+            body.append("/bounty <a question you want answered>", st["accent"])
+            hint = "enter  open the lobby   ·   ctrl+o  full tutorial"
         self.query_one("#ob-body", Static).update(body)
         self.query_one("#ob-note", Static).update(self.note)
         self.query_one("#ob-hint", Static).update(Text(hint))
@@ -267,13 +314,17 @@ class OnboardingScreen(Screen):
         st, t = self.app.st, Text()
         n_keys = len(keys.PROVIDERS)
         groups = [("welcome", ["welcome"]), ("keys", [s for s in self.steps if isinstance(s, keys.Provider)])]
-        groups += [(s, [s]) for s in ("privacy", "theme", "ready") if s in self.steps]
+        groups += [(s, [s]) for s in ("privacy", "theme") if s in self.steps]
+        groups += [("tour", [s for s in self.steps if isinstance(s, tuple)]), ("ready", ["ready"])]
+        groups = [(label, members) for label, members in groups if members and members[0] in self.steps]
         for i, (label, members) in enumerate(groups):
             if i:
                 t.append("  ─  ", st["dead"])
             if self.step in members:
                 if label == "keys":
                     label = f"keys {members.index(self.step) + 1}/{n_keys}"
+                elif label == "tour":
+                    label = f"tour {members.index(self.step) + 1}/{len(members)}"
                 t.append("● " + label, st["accent"])
             elif self.steps.index(members[-1]) < self.n:
                 t.append("✓ " + label, st["success"])
@@ -350,11 +401,24 @@ class OnboardingScreen(Screen):
             self.app.theme = self.app.pal_name
             self.query_one(Building).repaint()
             self.show()
+        elif k in ("left", "backspace") and self.n and isinstance(self.steps[self.n - 1], tuple):
+            event.stop()  # back through the tour (and from ready to its last page)
+            self.n -= 1
+            self.note = Text()
+            self.show()
         elif k == "enter" and step != "privacy":
             event.stop()
             if step == "theme":
                 self._save_theme()
             self.advance()
+
+    def action_open_link(self):
+        """ctrl+o: the sign-up page on a key step, the dashboard on privacy, else the tutorial."""
+        step = self.step
+        url = (step.url if isinstance(step, keys.Provider) else
+               keys.BY_ENV["INCEPTION_API_KEY"].url if step == "privacy" else TUTORIAL_URL)
+        self.app.open_url(url)
+        self._say(f"opened {url} in your browser")
 
     def _save_theme(self):
         from .config import save_config
@@ -623,7 +687,8 @@ class HotelApp(App):
         if errs:
             self.say("lobby.txt has invalid hand edits vs HEAD — fix before writing:\n" + "\n".join(errs[:6]), "error")
         else:
-            self.say("welcome. /help for commands. plain text is a monologue in [b]" + self.room + "[/b].")
+            self.say("welcome. /help for commands, /tutorial for a tour. plain text is a monologue in [b]"
+                     + self.room + "[/b].")
         self.refresh_all()
         if self.hotel.index is not None and not self.is_headless:
             self.hotel.index.warm_in_background()  # starts the embedder process (or first-time download)
@@ -632,16 +697,17 @@ class HotelApp(App):
         elif self.opening is not None:
             self.opening.loaded()
 
-    def action_setup(self):
+    def action_setup(self, tour_only: bool = False):
         def done(_):
             left = keys.missing_required()
-            self.say("checked in. /help for commands, /setup to change keys or theme." if not left else
+            self.say("checked in. /help for commands, /tutorial for the tour, /setup to change keys or theme."
+                     if not left else
                      "missing API keys: " + ", ".join(p.env for p in left) + " — /setup when you have them",
                      "success" if not left else "warning")
             self.refresh_all()
             self._entered(None)
 
-        self.push_screen(OnboardingScreen(self.hotel), done)
+        self.push_screen(OnboardingScreen(self.hotel, tour_only=tour_only), done)
 
     def _entered(self, ch: str | None):
         cmd = self.query_one("#cmd", Input)
@@ -998,6 +1064,8 @@ class HotelApp(App):
             return self.say(HELP, "body")
         if cmd in ("setup", "onboard"):
             return self.action_setup()
+        if cmd in ("tutorial", "tour"):
+            return self.action_setup(tour_only=True)
         if cmd in TYPE_CMDS:
             if not rest:
                 raise ValueError(f"/{cmd} needs text")

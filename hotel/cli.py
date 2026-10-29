@@ -35,6 +35,20 @@ def _hotel(args, **kw):
     return Hotel(paths, source=cmd, **kw)
 
 
+def _first_home() -> None:
+    """First `hotel` with no home anywhere: offer to create one instead of failing."""
+    from .config import set_default_home
+    from .core import init_home
+    default = Path.home() / "lobby"
+    print("Welcome to hotel. Your notes need a home: a folder holding lobby.txt (tracked in git).")
+    ans = input(f"Create it at {default}? [Enter = yes, or type another folder, n = cancel] ").strip()
+    if ans.lower() in ("n", "no"):
+        sys.exit("no hotel home — run `hotel init <dir>` when you're ready")
+    paths = init_home(Path(ans).expanduser() if ans and ans.lower() not in ("y", "yes") else default)
+    set_default_home(paths.root)
+    print(f"created {paths.root}; `hotel` now opens it from any directory")
+
+
 def doctor(args) -> int:
     """Check the install end to end; exit 1 on any hard failure."""
     import os
@@ -237,12 +251,7 @@ def _main(argv=None):
         if not USER_HOME_FILE.exists():
             set_default_home(paths.root)
             print(f"set as default home ({USER_HOME_FILE}); `hotel` now works from any directory")
-        left = keys.missing_required()
-        if left and keys.interactive():
-            if input(f"\n{', '.join(p.env for p in left)} not set. Set up API keys now? [Y/n] ").strip().lower() in ("", "y", "yes"):
-                keys.onboard(home=paths)
-        elif left:
-            print("API keys missing: " + ", ".join(p.env for p in left) + " — run `hotel setup`")
+        print("next: run `hotel`. The first open walks you through API keys, privacy, theme and a short tour.")
         return
     if a.cmd == "log":
         from .config import load_config
@@ -262,9 +271,11 @@ def _main(argv=None):
         return
     if a.cmd in (None, "tui"):
         from .tui import HotelApp
+        if not a.home and find_root() is None and keys.interactive():
+            _first_home()
         h = _hotel(a, new_session=getattr(a, "new_session", False))
         left = keys.missing_required()
-        if left and keys.interactive():
+        if left and keys.interactive() and keys.onboarded():  # otherwise the onboarding screen covers it
             print("missing API keys: " + ", ".join(p.env for p in left) + " — run `hotel setup` (search and model features are off until then)", file=sys.stderr)
         HotelApp(h).run()
         return

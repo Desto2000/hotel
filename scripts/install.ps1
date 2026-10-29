@@ -15,4 +15,4 @@ uv tool update-shell | Out-Null
 if (-not (Test-Path "$LobbyDir\.hotel")) { hotel init $LobbyDir }
 hotel home $LobbyDir | Out-Null
 hotel doctor
-Write-Host "done: run 'hotel' from any directory (open a new terminal if PATH changed)"
+Write-Host "done: run 'hotel' from any directory (open a new terminal if PATH changed). The first open walks you through API keys and a short tour."

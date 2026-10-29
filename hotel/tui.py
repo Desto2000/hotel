@@ -108,6 +108,16 @@ class OpeningScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Building(on_done=lambda: self.dismiss(None), id="opening")
 
+    def loaded(self):
+        """The TUI is ready: show the lit hotel for one frame, then get out of the way. The
+        animation is a loading screen, so it never outlasts the loading."""
+        self.query_one(Building).finish()
+
+        def leave():  # returns nothing: Textual awaits a timer callback's result
+            if self.is_current:
+                self.dismiss(None)
+        self.set_timer(0.06, leave)
+
     def on_key(self, event):
         event.stop()
         self.query_one(Building).timer.stop()
@@ -594,19 +604,33 @@ class HotelApp(App):
         self.query_one("#cmd").border_title = "write"
         t = self.query_one("#reg-table", DataTable)
         t.add_columns("id", "time", "kind", "actor", "tool", "status", "")
+        self.query_one("#cmd", Input).focus()
+        onboarding = (not self.is_headless and not keys.onboarded()) if self.onboard is None else self.onboard
+        self.opening = None
+        if not onboarding and ((not self.is_headless) if self.splash is None else self.splash):
+            self.opening = OpeningScreen()  # plays while the lobby loads below
+            self.push_screen(self.opening, self._entered)
+        self._load(onboarding)
+
+    @work(thread=True)
+    def _load(self, onboarding: bool):
+        """Off the UI thread, so the opening animation keeps its frame rate: commit hand edits
+        (git), then draw the lobby and end the animation."""
         errs = self.hotel.sync_hand_edits()
+        self.call_from_thread(self._loaded, errs, onboarding)
+
+    def _loaded(self, errs: list[str], onboarding: bool):
         if errs:
             self.say("lobby.txt has invalid hand edits vs HEAD — fix before writing:\n" + "\n".join(errs[:6]), "error")
         else:
             self.say("welcome. /help for commands. plain text is a monologue in [b]" + self.room + "[/b].")
         self.refresh_all()
-        self.query_one("#cmd", Input).focus()
         if self.hotel.index is not None and not self.is_headless:
-            self.hotel.index.warm_in_background()  # load (or first-time download) the embedder off the UI thread
-        if (not self.is_headless and not keys.onboarded()) if self.onboard is None else self.onboard:
+            self.hotel.index.warm_in_background()  # starts the embedder process (or first-time download)
+        if onboarding:
             self.action_setup()
-        elif (not self.is_headless) if self.splash is None else self.splash:
-            self.push_screen(OpeningScreen(), self._entered)
+        elif self.opening is not None:
+            self.opening.loaded()
 
     def action_setup(self):
         def done(_):

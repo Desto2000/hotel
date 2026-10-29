@@ -11,14 +11,11 @@ plus a base_url.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from dataclasses import dataclass
 from typing import Callable
-
-import groq
-import inceptionai
-import openai
 
 from . import keys
 from .gateway import ToolResult, ToolSpec
@@ -47,12 +44,14 @@ class LLMError(RuntimeError):
     pass
 
 
-# sdk name -> (client class, its APIStatusError); keys.py probes keys through the same table
-SDKS = {
-    "inception": (inceptionai.Inception, inceptionai.APIStatusError),
-    "groq": (groq.Groq, groq.APIStatusError),
-    "openai": (openai.OpenAI, openai.APIStatusError),
-}
+# sdk name -> (module, client class); keys.py probes keys through the same table
+SDKS = {"inception": ("inceptionai", "Inception"), "groq": ("groq", "Groq"), "openai": ("openai", "OpenAI")}
+
+
+def sdk(name: str) -> tuple[type, type[Exception]]:
+    """(client class, its APIStatusError). Imported on first use: the SDKs cost ~0.4 s at startup."""
+    mod = importlib.import_module(SDKS[name][0])
+    return getattr(mod, SDKS[name][1]), mod.APIStatusError
 
 
 @dataclass
@@ -109,7 +108,7 @@ def http_chat(profile: Profile, cfg: dict, body: dict) -> bytes:
             "then set inception_training_opt_out_confirmed=true in .hotel/config.json"
         )
     # the SDKs back off on 429/5xx and honours the provider's retry-after hint
-    client_cls, status_error = SDKS[profile.sdk]
+    client_cls, status_error = sdk(profile.sdk)
     client = client_cls(api_key=profile.key(), base_url=profile.base_url, timeout=120, max_retries=4)
     try:
         raw = client.chat.completions.with_raw_response.create(**body)

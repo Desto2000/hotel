@@ -46,8 +46,8 @@ def _exa_status(key: str) -> int:
 
 def _models_status(sdk: str) -> Callable[[str], int]:
     def check(key: str) -> int:
-        from .llm import SDKS  # llm imports keys; resolved lazily
-        client_cls, status_error = SDKS[sdk]
+        from .llm import sdk as load_sdk  # llm imports keys; resolved lazily
+        client_cls, status_error = load_sdk(sdk)
         try:
             client_cls(api_key=key, timeout=15, max_retries=0).models.list()
         except status_error as ex:

@@ -76,9 +76,10 @@ def validate_text(text: str, oracle: RegOracle | None = None) -> tuple[Lobby | N
 
 
 def validate_transition(old_text: str, new_text: str, oracle: RegOracle | None = None) -> list[str]:
-    old, e1 = validate_text(old_text, None)  # old was accepted when written
-    if old is None:
-        return ["previous lobby does not parse: " + "; ".join(e1[:3])]
+    try:
+        old = parse(old_text)  # old was accepted when written: parse it, don't re-check it
+    except LobbyParseError as ex:
+        return ["previous lobby does not parse: " + "; ".join(f"line {n}: {m}" for n, m in ex.errors[:3])]
     new, errs = validate_text(new_text, oracle)
     if new is None:
         return errs

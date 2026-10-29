@@ -225,7 +225,7 @@ class Hotel:
             "ops": [], "hand_edit": True, "origin": "user",
             "before": self.blobs.put_text(head), "after": self.blobs.put_text(cur), "commit": commit,
         })
-        self.rebuild()
+        self.derived.rebuild(cur, self.paths.directory, parse(cur))  # validated above
         return []
 
     # ------------------------------------------------------------- apply
@@ -276,7 +276,7 @@ class Hotel:
             "before": self.blobs.put_text(old), "after": self.blobs.put_text(text), "commit": commit,
             "promoted": [r for r, _ in promotes],
         })
-        self.rebuild()
+        self.derived.rebuild(text, self.paths.directory, parse(text))  # validated above
         return ApplyResult(created, touched, commit, entry.id)
 
     # ------------------------------------------------------------- residents

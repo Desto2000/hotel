@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 HEADER = "#! hotel-lobby v1"
 
@@ -102,16 +103,20 @@ class Entry:
 
 @dataclass
 class Lobby:
+    """A parsed lobby. `parse` caches and shares these: treat them as read-only
+    (ops copy `lines` before editing)."""
     lines: list[str]
     rooms: list[str]
     room_line: dict[str, int]
     entries: dict[str, Entry]
+    by_room: dict[str, list[Entry]] = field(default_factory=dict)
+    _max_num: int = 0
 
     def in_room(self, room: str) -> list[Entry]:
-        return [e for e in self.entries.values() if e.room == room]
+        return list(self.by_room.get(room, ()))
 
     def max_num(self) -> int:
-        return max((e.num for e in self.entries.values()), default=0)
+        return self._max_num
 
     def next_id(self, offset: int = 1) -> str:
         return f"L{self.max_num() + offset:04d}"
@@ -130,7 +135,11 @@ def split_lines(text: str) -> list[str]:
     return lines
 
 
+@lru_cache(maxsize=8)
 def parse(text: str) -> Lobby:
+    """Parse a lobby text. Cached by text: one write validates, applies and indexes the same
+    text several times, and the TUI re-reads the lobby on every refresh. Raises
+    LobbyParseError (never cached) for invalid text."""
     lines = split_lines(text)
     errors: list[tuple[int, str]] = []
     if not lines or lines[0] != HEADER:
@@ -147,10 +156,19 @@ def parse(text: str) -> Lobby:
         if line == "":
             cur = None
             continue
-        if "\t" in line or line != line.rstrip():
+        if "\t" in line or line[-1].isspace():
             errors.append((ln, "tabs / trailing whitespace not allowed"))
             continue
-        if m := ROOM_RE.match(line):
+        # Body lines are most of the file: test them by prefix, without a regex
+        # (same language as BODY_RE). Other kinds go to their own regex by prefix.
+        if line.startswith("  |") and (len(line) == 3 or line[3] == " "):
+            if cur is None or phase not in ("head", "body"):
+                errors.append((ln, "body line outside an entry header/body"))
+                continue
+            cur.body.append(line[4:])
+            cur.end, phase = i, "body"
+            continue
+        if line.startswith("== ") and (m := ROOM_RE.match(line)):
             name = m.group(1)
             if name in room_line:
                 errors.append((ln, f"room {name!r} already declared on line {room_line[name] + 1}"))
@@ -159,7 +177,7 @@ def parse(text: str) -> Lobby:
                 room_line[name] = i
             room, cur = name, None
             continue
-        if m := ENTRY_RE.match(line):
+        if line[0] == "@" and (m := ENTRY_RE.match(line)):
             eid, sigil, etype, origin, ts = m.groups()
             if room is None:
                 errors.append((ln, "entry outside of any room"))
@@ -177,14 +195,7 @@ def parse(text: str) -> Lobby:
             entries.setdefault(eid, cur)
             phase = "head"
             continue
-        if m := BODY_RE.match(line):
-            if cur is None or phase not in ("head", "body"):
-                errors.append((ln, "body line outside an entry header/body"))
-                continue
-            cur.body.append(m.group(1) or "")
-            cur.end, phase = i, "body"
-            continue
-        if m := META_RE.match(line):
+        if line.startswith("  + ") and (m := META_RE.match(line)):
             key, val = m.groups()
             if cur is None or phase not in ("body", "meta"):
                 errors.append((ln, "meta line must follow an entry body"))
@@ -203,7 +214,10 @@ def parse(text: str) -> Lobby:
             errors.append((e.start + 1, f"{e.id} has no body"))
     if errors:
         raise LobbyParseError(errors)
-    return Lobby(lines, rooms, room_line, entries)
+    by_room: dict[str, list[Entry]] = {}
+    for e in entries.values():
+        by_room.setdefault(e.room, []).append(e)
+    return Lobby(lines, rooms, room_line, entries, by_room, max((e.num for e in entries.values()), default=0))
 
 
 def render_entry(

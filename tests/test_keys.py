@@ -95,3 +95,31 @@ def test_first_open_without_a_home_offers_one_then_opens_the_tui(tmp_path, monke
     root = (tmp_path / "notes").resolve()
     assert opened == [root] and (root / "lobby.txt").exists()
     assert config.find_root(tmp_path / "elsewhere") == root  # became the default home
+
+
+def test_update_check_lists_new_commits_and_changes_nothing(tmp_path, monkeypatch, capsys):
+    import json
+    import subprocess
+
+    from hotel import cli
+
+    def git(*a, cwd=tmp_path):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True,
+                              capture_output=True, text=True).stdout.strip()
+    up = tmp_path / "upstream"
+    up.mkdir()
+    git("init", "-q", "-b", "master", cwd=up)
+    git("commit", "-q", "--allow-empty", "-m", "first", cwd=up)
+    git("clone", "-q", str(up), "src")
+    installed = git("rev-parse", "HEAD", cwd=tmp_path / "src")
+    git("commit", "-q", "--allow-empty", "-m", "faster search", cwd=up)
+    state = tmp_path / "install.json"
+    state.write_text(json.dumps({"source": str(tmp_path / "src"), "ref": "master", "commit": installed}))
+    monkeypatch.setattr(cli, "INSTALL_STATE", state)
+
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["update", "--check"])
+    out = capsys.readouterr().out
+    assert ex.value.code == 0 and "1 new commit" in out and "faster search" in out
+    assert git("rev-parse", "HEAD", cwd=tmp_path / "src") == installed  # nothing moved, nothing installed
+    assert json.loads(state.read_text())["commit"] == installed

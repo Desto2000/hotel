@@ -129,7 +129,7 @@ class OpeningScreen(Screen):
         self.dismiss(None)
 
 
-TUTORIAL_URL = "https://github.com/Desto2000/hotel/blob/main/TUTORIAL.md"
+TUTORIAL_URL = "https://github.com/Desto2000/hotel/blob/master/TUTORIAL.md"
 
 # The tour: (title, intro, [(what you type, what it does)], outro). Each page is one onboarding step.
 TOUR = [

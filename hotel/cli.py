@@ -49,6 +49,85 @@ def _first_home() -> None:
     print(f"created {paths.root}; `hotel` now opens it from any directory")
 
 
+INSTALL_STATE = keys.KEYS_FILE.with_name("install.json")  # written by the web installer (hotel.lovania.dev)
+
+
+def update(args) -> int:
+    """Fetch the installer's managed checkout, list new commits, reinstall with uv.
+    On Windows the running hotel holds its own files open, so the reinstall runs in a
+    new console window once this process exits."""
+    import os
+    import shutil
+    import subprocess
+    from datetime import UTC, datetime
+    try:
+        state = json.loads(INSTALL_STATE.read_text(encoding="utf-8"))
+        src, ref = Path(state["source"]), state.get("ref") or "master"
+    except (OSError, ValueError, KeyError):
+        sys.exit("`hotel update` works on installs from the web installer:\n"
+                 "  curl -fsSL https://hotel.lovania.dev/install.sh | bash      (Linux/macOS)\n"
+                 "  irm https://hotel.lovania.dev/install.ps1 | iex             (Windows)\n"
+                 "From a git checkout, pull and rerun scripts/install.sh (or install.ps1) instead.")
+
+    def git(*a: str) -> str:
+        r = subprocess.run(["git", "-C", str(src), *a], capture_output=True, text=True, encoding="utf-8", check=False)
+        if r.returncode:
+            sys.exit(f"git {' '.join(a)} failed in {src}:\n{r.stderr.strip()}")
+        return r.stdout.strip()
+
+    print(f"checking {state.get('repo', 'origin')} ({ref})…")
+    git("fetch", "--quiet", "origin", ref)
+    new = git("rev-parse", "FETCH_HEAD")
+    old = state.get("commit") or git("rev-parse", "HEAD")
+    if new == old:
+        print(f"hotel is up to date ({old[:8]})")
+        return 0
+    log = git("log", "--oneline", "--no-decorate", f"{old}..{new}") if old else ""
+    lines = log.splitlines()
+    print(f"{len(lines) or 'new'} new commit{'' if len(lines) == 1 else 's'} ({old[:8]} -> {new[:8]}):")
+    for line in lines[:20]:
+        print("  " + line)
+    if len(lines) > 20:
+        print(f"  … and {len(lines) - 20} more")
+    if args.check:
+        print("run `hotel update` to install them")
+        return 0
+    uv = shutil.which("uv")
+    if not uv:
+        sys.exit("uv is not on PATH; rerun the installer, which installs it")
+    git("reset", "--hard", "--quiet", new)  # the installer's own checkout: nothing local to keep
+    os.environ.pop("RUST_LOG", None)  # uv logs every resolver step under RUST_LOG=info
+    py = (src / ".python-version").read_text(encoding="utf-8").strip()
+    cmd = [uv, "tool", "install", "--force", "--python", py, "--constraints", str(src / "constraints.txt"), str(src)]
+    done = json.dumps({**state, "commit": new, "updated_at": datetime.now(UTC).isoformat(timespec="seconds")},
+                      indent=2) + "\n"
+    if os.name == "nt":
+        import tempfile
+
+        def q(s: str) -> str:
+            return "'" + s.replace("'", "''") + "'"
+        script = Path(tempfile.gettempdir()) / "hotel-update.ps1"
+        script.write_text(
+            f"Wait-Process -Id {os.getpid()} -ErrorAction SilentlyContinue\n"
+            "Start-Sleep -Milliseconds 500  # the hotel.exe launcher exits just after Python\n"
+            f"Write-Host 'updating hotel to {new[:8]}...'\n"
+            f"& {' '.join(q(c) for c in cmd)}\n"
+            "if ($LASTEXITCODE -eq 0) {\n"
+            f"  [IO.File]::WriteAllText({q(str(INSTALL_STATE))}, @'\n{done}'@)\n"
+            "  Write-Host \"`nhotel updated. Run 'hotel' to open it.\" -ForegroundColor Green\n"
+            "} else { Write-Host \"`nupdate failed (exit $LASTEXITCODE); rerun 'hotel update'\" -ForegroundColor Red }\n"
+            "Read-Host 'press Enter to close'\n", encoding="utf-8-sig")
+        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+        print("finishing the update in a new window (it starts once this command exits)")
+        return 0
+    if subprocess.run(cmd, check=False).returncode:
+        sys.exit("reinstall failed; rerun `hotel update`")
+    INSTALL_STATE.write_text(done, encoding="utf-8")
+    print(f"hotel updated to {new[:8]}")
+    return 0
+
+
 def doctor(args) -> int:
     """Check the install end to end; exit 1 on any hard failure."""
     import os
@@ -193,6 +272,8 @@ def _main(argv=None):
     sub.add_parser("schema", help="print the librarian JSON schema")
     sub.add_parser("version")
     sub.add_parser("doctor", help="check install, home, lobby, reg chain, backups, keys")
+    s = sub.add_parser("update", help="update hotel to the latest version (web installer installs)")
+    s.add_argument("--check", action="store_true", help="only list new commits; install nothing")
     s = sub.add_parser("setup", aliases=["onboard"], help="guided API key onboarding (validates and stores keys)")
     s.add_argument("--only", action="append", metavar="ENV_NAME", help="just this key (repeatable)")
     s.add_argument("--no-check", action="store_true", help="skip the live validation request")
@@ -223,6 +304,8 @@ def _main(argv=None):
         from . import __version__
         print(__version__)
         return
+    if a.cmd == "update":
+        sys.exit(update(a))
     if a.cmd == "doctor":
         sys.exit(doctor(a))
     if a.cmd in ("setup", "onboard"):
